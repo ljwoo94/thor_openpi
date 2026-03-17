@@ -537,7 +537,7 @@ def quantize_model(
         for module in quantized_model.modules():
             assert not isinstance(module, torch.nn.Linear) or is_quantized_linear(module)
             if isinstance(module, torch.nn.Linear):
-                module.input_quantizer._trt_high_precision_dtype = "Half"
+                module.input_quantizer._trt_high_precision_dtype = "BFloat16"
                 module.input_quantizer._onnx_quantizer_type = "dynamic"
                 module.output_quantizer._onnx_quantizer_type = "dynamic"
                 module.weight_quantizer._onnx_quantizer_type = "static"

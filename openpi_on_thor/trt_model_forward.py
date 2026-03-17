@@ -55,7 +55,8 @@ def pi0_tensorrt_sample_actions(self, device, observation, noise=None, num_steps
     # Get batch size from images
     batch_size = images.shape[0]
 
-    target_dtype = torch.float16
+    # Update to match your desired engine precision (bfloat16 or float32 depending on engine bindings)
+    target_dtype = torch.bfloat16
 
     # Handle noise input - generate if not provided
     if noise is None:

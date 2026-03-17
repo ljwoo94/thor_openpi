@@ -368,7 +368,8 @@ def main():
 
     # Set engine path default if not provided
     if args.engine_path is None:
-        args.engine_path = os.path.join(args.checkpoint_dir, "model_fp16.engine")
+        # Defaults to model_fp32.engine because we export ONNX in fp32 to bypass PyTorch RoPE bug
+        args.engine_path = os.path.join(args.checkpoint_dir, "model_fp32.engine")
 
     print("=" * 60)
     print(f"π₀.5 Inference Test - Mode: {args.inference_mode.upper()}")
