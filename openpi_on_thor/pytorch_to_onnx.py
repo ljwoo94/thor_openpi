@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import copy
 import os
 import sys
 from pathlib import Path
@@ -537,7 +538,7 @@ def quantize_model(
         for module in quantized_model.modules():
             assert not isinstance(module, torch.nn.Linear) or is_quantized_linear(module)
             if isinstance(module, torch.nn.Linear):
-                module.input_quantizer._trt_high_precision_dtype = "BFloat16"
+                module.input_quantizer._trt_high_precision_dtype = "Float"
                 module.input_quantizer._onnx_quantizer_type = "dynamic"
                 module.output_quantizer._onnx_quantizer_type = "dynamic"
                 module.weight_quantizer._onnx_quantizer_type = "static"
@@ -574,8 +575,8 @@ def _prepare_model_for_export(
     """
     model.eval()
 
-    model = patch_model_for_export(model, compute_dtype=torch.float16)
-    model = model.to(torch.float16)
+    model = patch_model_for_export(model, compute_dtype=torch.float32)
+    model = model.to(torch.float32)
 
     if precision.lower() == "fp8":
         if dummy_inputs is None:
@@ -589,17 +590,17 @@ def _prepare_model_for_export(
                 checkpoint_dir,
                 num_calibration_samples,
                 str(device),
-                compute_dtype=torch.float16,
+                compute_dtype=torch.float32,
             )
 
         model = quantize_model(
             model, dummy_inputs, calibration_data, num_steps, enable_llm_nvfp4, quantize_attention_matmul
         )
-        dtype_str = "float8 (quantized from float16)"
+        dtype_str = "float8 (quantized from float32)"
         if enable_llm_nvfp4:
             dtype_str += " with NVFP4 LLM"
     else:
-        dtype_str = "float16"
+        dtype_str = "float32"
 
     device = next(model.parameters()).device
     print(f"  Model device: {device}, dtype: {dtype_str}")
