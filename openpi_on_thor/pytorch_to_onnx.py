@@ -23,6 +23,10 @@ from openpi_on_thor.calibration_data import load_calibration_data
 from modelopt.torch.quantization.nn import TensorQuantizer
 from modelopt.torch.quantization.config import QuantizerAttributeConfig
 
+# Set the continuous state indices to mask before FP8 calibration for models
+# that use a continuous `state_proj` input path.
+MASKED_STATE_DIMS: tuple[int, ...] = ()
+
 # ---------------------------------------------------------------------------
 # Patch load_pytorch to handle dtype mismatches and tied weights across
 # different safetensors / transformers versions (e.g. 25.09 vs 26.01 containers).
@@ -283,6 +287,32 @@ def _create_dummy_inputs(
     return dummy_inputs
 
 
+def _mask_unused_state_input_dims(model: torch.nn.Module) -> list[int]:
+    """Mask continuous state input columns before FP8 calibration."""
+    selected_dims = sorted({int(dim) for dim in MASKED_STATE_DIMS})
+
+    if not selected_dims:
+        print("  MASKED_STATE_DIMS is empty; skipping continuous state masking.")
+        return []
+
+    state_proj = getattr(model, "state_proj", None)
+    if state_proj is None:
+        print("  Model has no continuous state projection to mask; skipping.")
+        return []
+
+    invalid_dims = [dim for dim in selected_dims if dim < 0 or dim >= state_proj.in_features]
+    if invalid_dims:
+        raise ValueError(
+            f"State mask indices out of range for state_proj.in_features={state_proj.in_features}: {invalid_dims}"
+        )
+
+    with torch.no_grad():
+        state_proj.weight[:, selected_dims] = 0.0
+
+    print(f"  Masked {len(selected_dims)} continuous state dims before quantization: {selected_dims}")
+    return selected_dims
+
+
 def patch_model_for_export(model, compute_dtype=torch.float16):
     """
     Patch model to add compute_dtype support without modifying original code.
@@ -362,10 +392,12 @@ def patch_model_for_export(model, compute_dtype=torch.float16):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        images, img_masks, lang_tokens, lang_masks, lang_unused_mask, state = self._preprocess_observation(
+            observation, train=False
+        )
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
+            images, img_masks, lang_tokens, lang_masks, lang_unused_mask
         )
         prefix_att_2d_masks = make_att_2d_masks_hook(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks.to(dtype=torch.int64), dim=1) - 1
@@ -593,6 +625,7 @@ def _prepare_model_for_export(
                 compute_dtype=torch.float32,
             )
 
+        _mask_unused_state_input_dims(model)
         model = quantize_model(
             model, dummy_inputs, calibration_data, num_steps, enable_llm_nvfp4, quantize_attention_matmul
         )
@@ -809,7 +842,6 @@ def main():
         action="store_true",
         help="Enable QDQ nodes for attention matmul operations (only applies with --precision fp8)",
     )
-
     args = parser.parse_args()
 
     try:
