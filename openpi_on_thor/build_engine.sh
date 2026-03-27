@@ -65,7 +65,7 @@ echo ""
 /usr/src/tensorrt/bin/trtexec \
     --onnx="$ONNX_PATH" \
     --saveEngine="$ENGINE_PATH" \
-    --fp16 \
+    --bf16 \
     --fp8 \
     --useCudaGraph \
     --verbose \
