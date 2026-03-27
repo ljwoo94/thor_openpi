@@ -7,7 +7,6 @@ from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
-from openpi.models import tokenizer as _tokenizer
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
@@ -167,7 +166,6 @@ class PI0Pytorch(nn.Module):
             list(observation.image_masks.values()),
             observation.tokenized_prompt,
             observation.tokenized_prompt_mask,
-            observation.tokenized_prompt_unused_mask,
             observation.state,
         )
 
@@ -186,7 +184,7 @@ class PI0Pytorch(nn.Module):
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, lang_unused_mask=None
+        self, images, img_masks, lang_tokens, lang_masks
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
@@ -218,15 +216,6 @@ class PI0Pytorch(nn.Module):
             return lang_emb * math.sqrt(lang_emb_dim)
 
         lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
-        zero_prompt_tokens = bool(_tokenizer.UNUSED_STATE_DIMS)
-        if lang_unused_mask is None and zero_prompt_tokens and self.pi05:
-            lang_unused_mask = torch.logical_and(
-                lang_masks.to(dtype=torch.bool, device=lang_emb.device),
-                lang_tokens.to(device=lang_emb.device) == _tokenizer.UNUSED_STATE_TOKEN_ID,
-            )
-
-        if lang_unused_mask is not None:
-            lang_emb = lang_emb.masked_fill(lang_unused_mask[:, :, None].to(dtype=torch.bool, device=lang_emb.device), 0.0)
 
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
@@ -326,9 +315,7 @@ class PI0Pytorch(nn.Module):
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, lang_unused_mask, state = self._preprocess_observation(
-            observation, train=True
-        )
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -340,9 +327,7 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, lang_unused_mask
-        )
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -395,13 +380,9 @@ class PI0Pytorch(nn.Module):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, lang_unused_mask, state = self._preprocess_observation(
-            observation, train=False
-        )
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, lang_unused_mask
-        )
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 

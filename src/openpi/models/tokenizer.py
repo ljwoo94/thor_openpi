@@ -10,10 +10,6 @@ from transformers import AutoProcessor
 import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
 import openpi.shared.download as download
 
-# Edit this tuple directly for deployment-specific PI05 unused state dims.
-UNUSED_STATE_DIMS: tuple[int, ...] = ()
-UNUSED_STATE_TOKEN_ID = 0
-
 
 class PaligemmaTokenizer:
     def __init__(self, max_len: int = 48):
@@ -23,47 +19,14 @@ class PaligemmaTokenizer:
         with path.open("rb") as f:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
-    def _get_unused_state_dims(self, state_dim: int) -> list[int]:
-        normalized_dims = sorted({int(dim) for dim in UNUSED_STATE_DIMS})
-        invalid_dims = [dim for dim in normalized_dims if dim < 0 or dim >= state_dim]
-        if invalid_dims:
-            raise ValueError(f"UNUSED_STATE_DIMS out of range for state_dim={state_dim}: {invalid_dims}")
-        return normalized_dims
-
-    def _tokenize_pi05_prompt(
-        self, cleaned_text: str, discretized_state: np.ndarray
-    ) -> tuple[list[int], np.ndarray | None]:
-        state_dim = int(discretized_state.shape[-1])
-        unused_state_dims = self._get_unused_state_dims(state_dim)
-        state_tokens = [str(int(value)) for value in discretized_state.tolist()]
-
-        state_str = " ".join(state_tokens)
-        full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
-        tokens = self._tokenizer.encode(full_prompt, add_bos=True)
-
-        if not unused_state_dims:
-            return tokens, None
-
-        unused_mask = np.zeros(len(tokens), dtype=np.bool_)
-        running_prompt = f"Task: {cleaned_text}, State:"
-        prev_len = len(self._tokenizer.encode(running_prompt, add_bos=True))
-
-        for state_idx, state_token in enumerate(state_tokens):
-            running_prompt += f" {state_token}"
-            current_len = len(self._tokenizer.encode(running_prompt, add_bos=True))
-            if state_idx in unused_state_dims:
-                unused_mask[prev_len:current_len] = True
-            prev_len = current_len
-
-        return tokens, unused_mask
-
-    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
         cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
-        unused_mask = None
         if state is not None:
             # This is the Pi05 format, where the state is part of the discrete language input.
             discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
-            tokens, unused_mask = self._tokenize_pi05_prompt(cleaned_text, discretized_state)
+            state_str = " ".join(map(str, discretized_state))
+            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+            tokens = self._tokenizer.encode(full_prompt, add_bos=True)
         else:
             # This is the Pi0 format, where the state is part of the continuous action expert input.
             # tokenize "\n" separately as the "start of answer" token
@@ -73,8 +36,6 @@ class PaligemmaTokenizer:
             padding = [False] * (self._max_len - tokens_len)
             mask = [True] * tokens_len + padding
             tokens = tokens + padding
-            if unused_mask is not None:
-                unused_mask = np.pad(unused_mask, (0, self._max_len - tokens_len), constant_values=False)
         else:
             if len(tokens) > self._max_len:
                 logging.warning(
@@ -83,16 +44,8 @@ class PaligemmaTokenizer:
                 )
             tokens = tokens[: self._max_len]
             mask = [True] * self._max_len
-            if unused_mask is not None:
-                unused_mask = unused_mask[: self._max_len]
 
-        tokens = np.asarray(tokens)
-        if unused_mask is not None:
-            unused_mask = np.asarray(unused_mask)
-            tokens = tokens.copy()
-            tokens[unused_mask] = UNUSED_STATE_TOKEN_ID
-
-        return tokens, np.asarray(mask), None if unused_mask is None else unused_mask
+        return np.asarray(tokens), np.asarray(mask)
 
 
 class FASTTokenizer:

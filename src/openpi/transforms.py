@@ -262,11 +262,8 @@ class TokenizePrompt(DataTransformFn):
         if not isinstance(prompt, str):
             prompt = prompt.item()
 
-        tokens, token_masks, token_unused_mask = self.tokenizer.tokenize(prompt, state)
-        output = {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
-        if token_unused_mask is not None:
-            output["tokenized_prompt_unused_mask"] = token_unused_mask
-        return output
+        tokens, token_masks = self.tokenizer.tokenize(prompt, state)
+        return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
 
 
 @dataclasses.dataclass(frozen=True)
