@@ -23,6 +23,10 @@ from openpi_on_thor.calibration_data import load_calibration_data
 from modelopt.torch.quantization.nn import TensorQuantizer
 from modelopt.torch.quantization.config import QuantizerAttributeConfig
 
+# Set the 44-dim continuous state/action indices to mask before FP8 calibration.
+# For pi05, this masks action_in_proj and action_out_proj.
+MASKED_UNUSED_DIMS: tuple[int, ...] = ()
+
 # ---------------------------------------------------------------------------
 # Patch load_pytorch to handle dtype mismatches and tied weights across
 # different safetensors / transformers versions (e.g. 25.09 vs 26.01 containers).
@@ -509,6 +513,20 @@ def quantize_model(
             mdl.eval()
             for batch_idx, (observation, noise) in enumerate(calibration_data):
                 with torch.no_grad():
+                    # ----------------------------------------------------
+                    # [VLM OOD 예방용 딥러닝 캘리브레이션 해킹 로직]
+                    # 미사용 19개 축의 0.0 값에 "자연스럽게 움직이는 관절 데이터"를 복사!
+                    
+                    # 1. 왼손 12축 (미사용) 덮어쓰기 (인덱스: 32~43)
+                    # 왼팔 7축(13~19)과 오른손 사용 5축(20~24)의 데이터를 그대로 복사
+                    observation.state[:, 32:39] = observation.state[:, 13:20] 
+                    observation.state[:, 39:44] = observation.state[:, 20:25] 
+
+                    # 2. 오른손 7축 (미사용) 덮어쓰기 (인덱스: 25~31)
+                    # 오른팔 7축(6~12)을 그대로 복사
+                    observation.state[:, 25:32] = observation.state[:, 6:13]  
+                    # ----------------------------------------------------
+
                     try:
                         device = next(mdl.parameters()).device
                         _ = mdl.sample_actions(device, observation, noise=noise, num_steps=num_steps)
@@ -544,6 +562,52 @@ def quantize_model(
                 module.weight_quantizer._onnx_quantizer_type = "static"
 
     return quantized_model
+
+
+def _mask_unused_dims(model: torch.nn.Module) -> list[int]:
+    """Mask continuous state/action input and output columns before FP8 calibration."""
+    selected_dims = sorted({int(dim) for dim in MASKED_UNUSED_DIMS})
+
+    if not selected_dims:
+        print("  MASKED_UNUSED_DIMS is empty; skipping continuous state/action masking.")
+        return []
+
+    with torch.no_grad():
+        masked_count = 0
+        
+        # 1. Mask state_proj if it exists (for pi0)
+        state_proj = getattr(model, "state_proj", None)
+        if state_proj is not None:
+            valid_dims = [d for d in selected_dims if 0 <= d < state_proj.in_features]
+            if valid_dims:
+                state_proj.weight[:, valid_dims] = 0.0
+                masked_count += 1
+                print(f"  Masked {len(valid_dims)} input dims in state_proj")
+
+        # 2. Mask action_in_proj if it exists (for pi05 and pi0)
+        action_in_proj = getattr(model, "action_in_proj", None)
+        if action_in_proj is not None:
+            valid_dims = [d for d in selected_dims if 0 <= d < action_in_proj.in_features]
+            if valid_dims:
+                action_in_proj.weight[:, valid_dims] = 0.0
+                masked_count += 1
+                print(f"  Masked {len(valid_dims)} input dims in action_in_proj")
+                
+        # 3. Mask action_out_proj if it exists (for pi05 and pi0)
+        action_out_proj = getattr(model, "action_out_proj", None)
+        if action_out_proj is not None:
+            valid_dims = [d for d in selected_dims if 0 <= d < action_out_proj.out_features]
+            if valid_dims:
+                action_out_proj.weight[valid_dims, :] = 0.0
+                if action_out_proj.bias is not None:
+                    action_out_proj.bias[valid_dims] = 0.0
+                masked_count += 1
+                print(f"  Masked {len(valid_dims)} output dims in action_out_proj")
+                
+        if masked_count == 0:
+            print("  Model has no continuous state/action projection to mask; skipping.")
+            
+    return selected_dims
 
 
 def _prepare_model_for_export(
@@ -593,6 +657,7 @@ def _prepare_model_for_export(
                 compute_dtype=torch.float32,
             )
 
+        _mask_unused_dims(model)
         model = quantize_model(
             model, dummy_inputs, calibration_data, num_steps, enable_llm_nvfp4, quantize_attention_matmul
         )
