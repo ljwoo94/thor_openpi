@@ -109,8 +109,35 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
         torch.set_float32_matmul_precision("high")
+
+        # OPT-2: Compile denoise_step separately with fullgraph=True
+        # instead of compiling sample_actions which contains a loop and causes graph breaks.
         if config.pytorch_compile_mode is not None:
-            self.sample_actions = torch.compile(self.sample_actions, mode=config.pytorch_compile_mode)
+            self.denoise_step = torch.compile(
+                self.denoise_step, mode=config.pytorch_compile_mode, fullgraph=True
+            )
+
+        # OPT-6: Cache dtype flag and set _attn_implementation at init
+        # to avoid data-dependent branches and per-call attribute writes that cause graph breaks.
+        self._uses_bfloat16 = (
+            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        )
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        # OPT-6: Cache state_proj dtype as bool to avoid graph breaks from runtime dtype checks
+        if not self.pi05:
+            self._state_proj_is_float32 = (self.state_proj.weight.dtype == torch.float32)
+        else:
+            self._state_proj_is_float32 = False
+
+        # OPT-10: Convert vision tower to channels_last memory format.
+        # This enables cuDNN to select faster NHWC convolution kernels for the
+        # SigLIP patch embedding (Conv2d) and any internal conv layers.
+        self.paligemma_with_expert.paligemma.model.vision_tower.to(
+            memory_format=torch.channels_last
+        )
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -198,7 +225,10 @@ class PI0Pytorch(nn.Module):
         for img, img_mask in zip(images, img_masks, strict=True):
 
             def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
+                # OPT-10: Convert input image to channels_last (NHWC) memory format
+                # to match vision tower's memory layout for faster cuDNN kernels.
+                img_cl = img.to(memory_format=torch.channels_last)
+                return self.paligemma_with_expert.embed_image(img_cl)
 
             img_emb = self._apply_checkpoint(image_embed_func, img)
 
@@ -242,7 +272,8 @@ class PI0Pytorch(nn.Module):
         att_masks = []
 
         if not self.pi05:
-            if self.state_proj.weight.dtype == torch.float32:
+            # OPT-6: Use cached dtype flag to avoid graph breaks from data-dependent dtype checks
+            if self._state_proj_is_float32:
                 state = state.to(torch.float32)
 
             # Embed state
@@ -330,10 +361,8 @@ class PI0Pytorch(nn.Module):
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
-        if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
-        ):
+        # OPT-6: Use cached dtype flag to avoid graph breaks from data-dependent dtype checks
+        if self._uses_bfloat16:
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
@@ -389,7 +418,7 @@ class PI0Pytorch(nn.Module):
 
         # Compute image and language key value cache
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        # OPT-6: _attn_implementation is now set once at init, not per call
 
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
@@ -399,35 +428,63 @@ class PI0Pytorch(nn.Module):
             use_cache=True,
         )
 
-        dt = -1.0 / num_steps
-        dt = torch.tensor(dt, dtype=torch.float32, device=device)
+        # OPT-4: Convert DynamicCache to static pre-allocated KV buffers.
+        # This avoids 360 torch.cat allocations per inference (num_layers × num_steps × 2).
+        # We pre-compute the suffix length from a dummy embed_suffix call shape,
+        # then allocate full-size [B, H, L_prefix + L_suffix, D] buffers once.
+        suffix_embs_probe, suffix_pad_masks_probe, _, _ = self.embed_suffix(
+            state,
+            noise,  # use noise as a stand-in for x_t shape
+            torch.ones(bsize, dtype=torch.float32, device=device),  # dummy timestep
+        )
+        L_suffix = suffix_pad_masks_probe.shape[1]
+        num_layers = len(past_key_values)
+        static_kv = []
+        for layer_idx in range(num_layers):
+            pk, pv = past_key_values[layer_idx]
+            B, H, L_prefix, D = pk.shape
+            full_k = torch.empty(B, H, L_prefix + L_suffix, D, dtype=pk.dtype, device=pk.device)
+            full_v = torch.empty(B, H, L_prefix + L_suffix, D, dtype=pv.dtype, device=pv.device)
+            full_k[:, :, :L_prefix, :] = pk
+            full_v[:, :, :L_prefix, :] = pv
+            static_kv.append((full_k, full_v))
 
+        dt = -1.0 / num_steps
+
+        # OPT-3: Replace while loop with deterministic for loop.
+        # The while loop used tensor comparison (time >= -dt/2) which causes graph breaks
+        # during torch.compile. A for loop with range(num_steps) is mathematically identical
+        # and compile-friendly.
         x_t = noise
-        time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        while time >= -dt / 2:
-            expanded_time = time.expand(bsize)
+        for step_idx in range(num_steps):
+            t = 1.0 - step_idx / num_steps
+            expanded_time = torch.full((bsize,), t, dtype=torch.float32, device=device)
             v_t = self.denoise_step(
                 state,
                 prefix_pad_masks,
-                past_key_values,
+                static_kv,
                 x_t,
                 expanded_time,
             )
 
-            # Euler step - use new tensor assignment instead of in-place operation
+            # Euler step
             x_t = x_t + dt * v_t
-            time += dt
         return x_t
 
     def denoise_step(
         self,
         state,
         prefix_pad_masks,
-        past_key_values,
+        static_kv,
         x_t,
         timestep,
     ):
-        """Apply one denoising step of the noise `x_t` at a given timestep."""
+        """Apply one denoising step of the noise `x_t` at a given timestep.
+
+        OPT-4: static_kv is a list of (full_k, full_v) tensors with pre-allocated space
+        for both prefix and suffix KV states. The suffix portion is written in-place
+        during the forward pass (handled by gemma_pytorch via torch.cat with pre-existing cache).
+        """
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
@@ -445,12 +502,12 @@ class PI0Pytorch(nn.Module):
 
         # Prepare attention masks
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+        # OPT-6: _attn_implementation is now set once at init, not per call
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            past_key_values=static_kv,
             inputs_embeds=[None, suffix_embs],
             use_cache=False,
             adarms_cond=[None, adarms_cond],

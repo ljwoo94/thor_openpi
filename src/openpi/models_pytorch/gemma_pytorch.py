@@ -1,6 +1,7 @@
 from typing import Literal
 
 import torch
+import torch.nn.functional as F  # noqa: N812
 from torch import nn
 from transformers import GemmaForCausalLM
 from transformers import PaliGemmaForConditionalGeneration
@@ -168,9 +169,19 @@ class PaliGemmaWithExpertModel(nn.Module):
 
                     input_shape = hidden_states.shape[:-1]
                     hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
-                    query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-                    key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-                    value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+                    # OPT-7: Use fused QKV projection if available (1 GEMM instead of 3)
+                    if hasattr(layer.self_attn, '_qkv_fused') and layer.self_attn._qkv_fused:
+                        qkv = layer.self_attn.qkv_proj(hidden_states)
+                        q_out, k_out, v_out = layer.self_attn._qkv_split_sizes
+                        query_state, key_state, value_state = qkv.split([q_out, k_out, v_out], dim=-1)
+                        query_state = query_state.view(hidden_shape).transpose(1, 2)
+                        key_state = key_state.view(hidden_shape).transpose(1, 2)
+                        value_state = value_state.view(hidden_shape).transpose(1, 2)
+                    else:
+                        query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                        key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                        value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
                     query_states.append(query_state)
                     key_states.append(key_state)
@@ -196,18 +207,22 @@ class PaliGemmaWithExpertModel(nn.Module):
                 batch_size = query_states.shape[0]
                 scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
 
-                # Attention computation
-                att_output, _ = modeling_gemma.eager_attention_forward(
-                    self.paligemma.language_model.layers[layer_idx].self_attn,
-                    query_states,
-                    key_states,
-                    value_states,
-                    attention_mask,
-                    scaling,
+                # OPT-1: SDPA attention — fused single-kernel attention (FlashAttention-style)
+                # Replaces eager_attention_forward (3 kernels: matmul→softmax→matmul) with a single
+                # fused kernel that avoids materializing the full L×L attention matrix.
+                num_kv_groups = self.paligemma.language_model.layers[layer_idx].self_attn.num_key_value_groups
+                key_states_rep = modeling_gemma.repeat_kv(key_states, num_kv_groups)
+                value_states_rep = modeling_gemma.repeat_kv(value_states, num_kv_groups)
+                att_output = F.scaled_dot_product_attention(
+                    query_states, key_states_rep, value_states_rep,
+                    attn_mask=attention_mask, scale=scaling,
                 )
+                att_output = att_output.transpose(1, 2).contiguous()
+
                 # Get head_dim from the current layer, not from the model
                 head_dim = self.paligemma.language_model.layers[layer_idx].self_attn.head_dim
-                att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
+                num_heads = self.paligemma.language_model.config.num_attention_heads
+                att_output = att_output.reshape(batch_size, -1, num_heads * head_dim)
 
                 # Process layer outputs
                 outputs_embeds = []
@@ -216,19 +231,26 @@ class PaliGemmaWithExpertModel(nn.Module):
                     layer = models[i].layers[layer_idx]
                     end_pos = start_pos + hidden_states.shape[1]
 
-                    if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
-                        att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
-                    out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
+                    # OPT-6: Cast unconditionally to avoid graph breaks from data-dependent dtype checks
+                    att_slice = att_output[:, start_pos:end_pos].to(layer.self_attn.o_proj.weight.dtype)
+                    out_emb = layer.self_attn.o_proj(att_slice)
 
                     # first residual
                     out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
                     after_first_residual = out_emb.clone()
                     out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
-                    # Convert to bfloat16 if the next layer (mlp) uses bfloat16
-                    if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
-                        out_emb = out_emb.to(dtype=torch.bfloat16)
+                    # OPT-6: Cast unconditionally to avoid graph breaks from data-dependent dtype checks
+                    out_emb = out_emb.to(dtype=layer.mlp.down_proj.weight.dtype)
 
-                    out_emb = layer.mlp(out_emb)
+                    # OPT-7: Use fused gate+up projection if available (1 GEMM instead of 2)
+                    if hasattr(layer.mlp, '_gate_up_fused') and layer.mlp._gate_up_fused:
+                        gate_up = layer.mlp.gate_up_proj(out_emb)
+                        split = layer.mlp._gate_up_split_size
+                        gate_out, up_out = gate_up.split([split, split], dim=-1)
+                        out_emb = layer.mlp.down_proj(layer.mlp.act_fn(gate_out) * up_out)
+                    else:
+                        out_emb = layer.mlp(out_emb)
+
                     # second residual
                     out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
                     outputs_embeds.append(out_emb)
