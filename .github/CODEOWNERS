@@ -8,9 +8,3 @@
 # Each line is a file pattern followed by one or more owners.
 
 # Global owners.
-* @jimmyt857 @Michael-Equi @kvablack
-
-src/openpi/models/ @kvablack
-src/openpi/training/ @kvablack
-
-scripts/ @jimmyt857 @kvablack
