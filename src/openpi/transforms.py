@@ -248,6 +248,7 @@ class AbsoluteActions(DataTransformFn):
 class TokenizePrompt(DataTransformFn):
     tokenizer: _tokenizer.PaligemmaTokenizer
     discrete_state_input: bool = False
+    cache_prompt: bool = True
 
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.pop("prompt", None)) is None:
@@ -262,8 +263,22 @@ class TokenizePrompt(DataTransformFn):
         if not isinstance(prompt, str):
             prompt = prompt.item()
 
-        tokens, token_masks = self.tokenizer.tokenize(prompt, state)
+        tokens, token_masks = self._tokenize(prompt, state)
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
+
+    def _tokenize(self, prompt: str, state: np.ndarray | None) -> tuple[np.ndarray, np.ndarray]:
+        if state is not None or not self.cache_prompt:
+            return self.tokenizer.tokenize(prompt, state)
+
+        cached_prompt = getattr(self, "_cached_prompt", None)
+        if cached_prompt == prompt:
+            return getattr(self, "_cached_tokens"), getattr(self, "_cached_token_masks")
+
+        tokens, token_masks = self.tokenizer.tokenize(prompt, None)
+        object.__setattr__(self, "_cached_prompt", prompt)
+        object.__setattr__(self, "_cached_tokens", tokens)
+        object.__setattr__(self, "_cached_token_masks", token_masks)
+        return tokens, token_masks
 
 
 @dataclasses.dataclass(frozen=True)
