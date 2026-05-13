@@ -64,44 +64,77 @@ class Policy(BasePolicy):
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
 
+    def _sync_pytorch_device(self) -> None:
+        if self._is_pytorch_model and self._pytorch_device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.synchronize(self._pytorch_device)
+
+    def _numpy_to_torch(self, x: Any) -> torch.Tensor:
+        array = np.asarray(x)
+        if any(stride < 0 for stride in array.strides):
+            array = np.ascontiguousarray(array)
+        return torch.as_tensor(array, device=self._pytorch_device)
+
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        total_start = time.perf_counter()
+
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
+
+        transform_start = time.perf_counter()
         inputs = self._input_transform(inputs)
+        input_transform_ms = (time.perf_counter() - transform_start) * 1000
+
+        tensor_conversion_start = time.perf_counter()
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
             self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
         else:
             # Convert inputs to PyTorch tensors and move to correct device
-            inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
+            inputs = jax.tree.map(lambda x: self._numpy_to_torch(x)[None, ...], inputs)
             sample_rng_or_pytorch_device = self._pytorch_device
+        tensor_conversion_ms = (time.perf_counter() - tensor_conversion_start) * 1000
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
         if noise is not None:
-            noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
+            noise = self._numpy_to_torch(noise) if self._is_pytorch_model else jnp.asarray(noise)
 
             if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
 
         observation = _model.Observation.from_dict(inputs)
-        start_time = time.monotonic()
-        outputs = {
-            "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
-        }
-        model_time = time.monotonic() - start_time
+        self._sync_pytorch_device()
+        sample_start = time.perf_counter()
+        if self._is_pytorch_model:
+            with torch.inference_mode():
+                actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        else:
+            actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        self._sync_pytorch_device()
+        model_ms = (time.perf_counter() - sample_start) * 1000
+
+        outputs = {"state": inputs["state"], "actions": actions}
+
+        output_conversion_start = time.perf_counter()
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
+        output_conversion_ms = (time.perf_counter() - output_conversion_start) * 1000
 
+        output_transform_start = time.perf_counter()
         outputs = self._output_transform(outputs)
+        output_transform_ms = (time.perf_counter() - output_transform_start) * 1000
         outputs["policy_timing"] = {
-            "infer_ms": model_time * 1000,
+            "infer_ms": model_ms,
+            "input_transform_ms": input_transform_ms,
+            "tensor_conversion_ms": tensor_conversion_ms,
+            "output_conversion_ms": output_conversion_ms,
+            "output_transform_ms": output_transform_ms,
+            "total_ms": (time.perf_counter() - total_start) * 1000,
         }
         return outputs
 

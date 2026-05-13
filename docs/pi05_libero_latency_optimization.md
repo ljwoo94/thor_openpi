@@ -207,12 +207,26 @@ LIBERO rollout result:
 Notes / regressions:
 ```
 
+Current baseline command for H100 or Jetson Thor:
+
+```bash
+uv run python scripts/benchmark_pi05_libero_latency.py \
+  --config-name pi05_libero \
+  --checkpoint-dir gs://openpi-assets/checkpoints/pi05_libero \
+  --device cuda \
+  --warmup-iters 10 \
+  --iters 100 \
+  --num-steps 10 \
+  --output-json /tmp/pi05_libero_latency.json
+```
+
 ## Progress Log
 
 | Date | Commit | Change | Expected Impact | Verification Status | User Feedback |
 | --- | --- | --- | --- | --- | --- |
 | 2026-05-13 | initial doc commit | Add living optimization plan and progress workflow. | Makes future optimization work auditable and keeps manual NVIDIA verification explicit. | Documentation-only; no NVIDIA verification needed. | Pending. |
 | 2026-05-13 | pending | Expand implementation-ready optimization phases and add baseline benchmark utility. | Enables reproducible H100/Jetson measurements before changing model code. | `py_compile` passed locally. Full CLI/runtime check is blocked on Apple Silicon because the project pins `jax[cuda12]`; NVIDIA manual verification required. | Pending. |
+| 2026-05-13 | pending | Add policy-level timing breakdown and `torch.inference_mode()` for PyTorch inference. | Separates transform, tensor conversion, model, output conversion, output transform, and total latency while removing autograd overhead. | `py_compile` and `git diff --check` passed locally. NVIDIA benchmark required for latency and correctness. | Pending. |
 
 ## Commit And Update Rule
 

@@ -131,7 +131,7 @@ def main(args: Args) -> None:
         _sync_if_needed(device)
 
     total_ms: list[float] = []
-    model_ms: list[float] = []
+    policy_timings: dict[str, list[float]] = {}
 
     logger.info("Measuring %d iterations", args.iters)
     for _ in range(args.iters):
@@ -140,8 +140,8 @@ def main(args: Args) -> None:
         result = policy.infer(obs, noise=noise)
         _sync_if_needed(device)
         total_ms.append((time.perf_counter() - start) * 1000)
-        if "policy_timing" in result and "infer_ms" in result["policy_timing"]:
-            model_ms.append(float(result["policy_timing"]["infer_ms"]))
+        for key, value in result.get("policy_timing", {}).items():
+            policy_timings.setdefault(key, []).append(float(value))
 
     summary = {
         "config_name": args.config_name,
@@ -152,7 +152,7 @@ def main(args: Args) -> None:
         "fixed_noise": args.fixed_noise,
         "hardware": _hardware_info(device),
         "total_policy_infer_ms": _stats(total_ms),
-        "model_reported_infer_ms": _stats(model_ms) if model_ms else None,
+        "policy_timing_ms": {key: _stats(values) for key, values in sorted(policy_timings.items())},
     }
 
     print(json.dumps(summary, indent=2))
