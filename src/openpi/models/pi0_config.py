@@ -31,9 +31,6 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
-    # PyTorch-only attention backend for PaliGemma/Gemma forward passes. Use this to benchmark core model math
-    # implementations such as eager attention and SDPA without changing checkpoint weights.
-    pytorch_attn_implementation: str = "eager"
     # PyTorch-only torch.compile mode for action sampling. Set to None to disable compilation.
     pytorch_compile_mode: str | None = "max-autotune"
 

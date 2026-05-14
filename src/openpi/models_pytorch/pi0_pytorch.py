@@ -96,9 +96,8 @@ class PI0Pytorch(nn.Module):
             use_adarms=[False, True] if self.pi05 else [False, False],
             precision=config.dtype,
         )
-        attn_implementation = config.pytorch_attn_implementation
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = attn_implementation  # noqa: SLF001
-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = attn_implementation  # noqa: SLF001
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, 32)

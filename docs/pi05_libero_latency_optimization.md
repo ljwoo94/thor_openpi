@@ -100,8 +100,10 @@ Purpose: make TorchInductor optimize stable regions.
 
 Purpose: optimize the real GPU hot spots after profiling confirms them.
 
-- Compare current eager attention with PyTorch SDPA for prefix and suffix passes.
-- Test Flash-style attention only where supported by installed PyTorch/Transformers/runtime.
+- Keep the patched Gemma/PaliGemma attention backend on eager unless a dedicated dtype-safe replacement is implemented.
+- Do not use the generic PyTorch SDPA backend in this repo: user validation showed it fails under compiled `sample_actions`
+  with an attention bias dtype mismatch in the patched BF16 stack.
+- Test Flash-style attention only where supported by installed PyTorch/Transformers/runtime and after mask/bias dtype handling is explicit.
 - Profile adaRMSNorm, gated residual, MLP, action projection, and attention kernels.
 - Implement custom Triton only after profiling shows a specific unfused operation is hot on H100 or Jetson Thor.
 - Candidate Triton/fused kernels:
@@ -161,8 +163,8 @@ NVIDIA verification:
 
 ## Detailed Implementation Order
 
-1. Benchmark core model math first: prefix VLM forward, Gemma expert denoise-step forward, and attention backend.
-2. Compare eager attention against SDPA on H100 and Jetson Thor.
+1. Benchmark core model math first: prefix VLM forward and Gemma expert denoise-step forward.
+2. Keep eager attention for the PyTorch path; pursue attention speed through TensorRT/QDQ/plugin paths instead of generic SDPA.
 3. Measure denoising-step count sensitivity with `--num-steps 10`, `8`, `6`, and `5`; accept only with rollout quality.
 4. Split and tune static compiled regions around prefix forward and a single denoise step.
 5. Add custom Triton kernels only for measured hot spots inside attention, adaRMSNorm, MLP, or residual math.
@@ -181,7 +183,7 @@ Python-level caching and input transform work is secondary. Do not add more cond
 | P1 | Avoid redundant numpy copies | `src/openpi/policies/policy.py` | Shape/dtype tests and benchmark |
 | P2 | Prompt-token cache | `src/openpi/transforms.py` or policy-local wrapper | Repeated prompt cache hit test |
 | P2 | Static suffix masks/timestep schedule | `src/openpi/models_pytorch/pi0_pytorch.py` | Fixed-noise equivalence and allocation reduction |
-| P2 | Attention backend override | `src/openpi/models/pi0_config.py`, `src/openpi/models_pytorch/pi0_pytorch.py` | H100/Jetson eager vs SDPA benchmark |
+| P2 | Attention acceleration | TensorRT/QDQ/plugin path | Avoid generic SDPA unless patched mask/bias dtypes are fixed |
 | P3 | Compile-region split | `src/openpi/models_pytorch/pi0_pytorch.py` | H100 and Jetson P50/P95 |
 | P3 | Attention backend experiments | PyTorch Gemma/PaliGemma config path | Correctness and benchmark |
 | P4 | Triton fused kernels | new or model-local kernel module | Kernel-level and end-to-end benchmark |
@@ -218,30 +220,6 @@ uv run python scripts/benchmark_pi05_libero_latency.py \
   --iters 100 \
   --num-steps 10 \
   --output-json /tmp/pi05_libero_latency.json
-```
-
-Current core-attention comparison commands:
-
-```bash
-uv run python scripts/benchmark_pi05_libero_latency.py \
-  --config-name pi05_libero \
-  --checkpoint-dir gs://openpi-assets/checkpoints/pi05_libero \
-  --device cuda \
-  --warmup-iters 10 \
-  --iters 100 \
-  --num-steps 10 \
-  --attn-implementation eager \
-  --output-json /tmp/pi05_libero_latency_eager.json
-
-uv run python scripts/benchmark_pi05_libero_latency.py \
-  --config-name pi05_libero \
-  --checkpoint-dir gs://openpi-assets/checkpoints/pi05_libero \
-  --device cuda \
-  --warmup-iters 10 \
-  --iters 100 \
-  --num-steps 10 \
-  --attn-implementation sdpa \
-  --output-json /tmp/pi05_libero_latency_sdpa.json
 ```
 
 Current compile-mode comparison commands:
@@ -288,13 +266,14 @@ uv run python scripts/benchmark_pi05_libero_latency.py \
 | 2026-05-13 | `1d60cf9` | Cache prompt-only tokenization in `TokenizePrompt`. | Reduced CPU transform work, but user verification showed no meaningful model inference gain. | Reverted in follow-up because VLM/denoise compute dominates. | Low impact. |
 | 2026-05-13 | `44890b7` | Precompute pi05 action suffix masks, position offsets, and timestep embedding basis. | Reduced small tensor construction, but user verification showed no meaningful model inference gain. | Reverted in follow-up; avoid extra hot-path conditionals before TensorRT/compile work. | Low impact. |
 | 2026-05-13 | `5c5fc42` | Move fixed attention backend setup out of the inference hot path. | Removes repeated config mutation from prefix encode and every denoise step, reducing Python side effects before compile-region work. | `py_compile` and `git diff --check` passed locally. NVIDIA benchmark required for latency and correctness. | Pending. |
-| 2026-05-14 | `3502880` | Add PyTorch attention backend override for eager-vs-SDPA core forward benchmarking. | Targets VLM and denoise forward math directly instead of Python caching overhead. | `py_compile` and `git diff --check` passed locally. H100/Jetson eager-vs-SDPA benchmark required. | Pending. |
+| 2026-05-14 | `3502880` | Add PyTorch attention backend override for eager-vs-SDPA core forward benchmarking. | Targeted VLM and denoise attention math. | Invalidated by user verification: SDPA fails under common compiled `sample_actions` due to attention bias/query dtype mismatch in the patched BF16 stack. Reverted in follow-up. | Do not use generic SDPA. |
 | 2026-05-14 | `e962ad1` | Replace tensor-valued denoising `while` loop with static integer `for range(num_steps)`. | Preserves the timestep schedule while making the repeated denoise forward path friendlier to TorchInductor and TensorRT graph capture. | `py_compile` and `git diff --check` passed locally. Fixed-noise H100/Jetson correctness and latency benchmark required. | Pending. |
 | 2026-05-14 | `8ff9c64` | Add PyTorch compile-mode override for no-compile, `reduce-overhead`, and `max-autotune` benchmarks. | Measures graph conversion cost and steady-state latency explicitly on H100 and Jetson Thor instead of assuming one compile mode is best. | `py_compile` and `git diff --check` passed locally. H100/Jetson compile-mode benchmark required. | Pending. |
 | 2026-05-14 | `5acb667` | Add ModelOpt/ONNX QDQ coverage reports and batch all camera images through one vision-tower forward. | QDQ coverage reporting is useful, but the batched vision change blocked compile conversion. | Keep QDQ reporting; revert batched vision prefix in follow-up. | Compile conversion failed for batched vision path. |
 | 2026-05-14 | `b834a7b`, `b36abc1` | Revert low-impact prompt token cache and suffix tensor precomputation. | Keeps optimization work focused on core VLM forward, denoise loop, attention kernels, quantization coverage, and TensorRT graph conversion. | Reverts completed. Local checks pending for this batch. | Requested after user validation. |
 | 2026-05-14 | `6690d5e` | Make Thor ONNX export denoise loop static and remove export hot-path attention config mutation. | Improves TensorRT/ONNX graph conversion for the real repeated denoise forward instead of Python-side preprocessing. | `py_compile` and `git diff --check` passed locally. Thor export and TensorRT build required. | Pending. |
 | 2026-05-14 | `188c6aa` | Revert batched vision prefix while keeping QDQ coverage, and add static-shape ONNX export option. | Avoids compile-breaking prefix logic and gives TensorRT a fixed-shape export path for stronger engine optimization. | `py_compile` and `git diff --check` passed locally. Thor static-shape export and engine build required. | Requested after compile conversion failure. |
+| 2026-05-14 | pending | Remove unusable SDPA benchmark/config switch and keep eager attention in PyTorch path. | Prevents invalid benchmark paths and keeps attention optimization focused on QDQ/TensorRT/plugin routes. | `py_compile` and `git diff --check` passed locally. | Requested after SDPA dtype failure. |
 
 ## Commit And Update Rule
 

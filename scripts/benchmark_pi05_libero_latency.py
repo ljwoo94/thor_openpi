@@ -34,8 +34,6 @@ class Args:
     iters: int = 50
     # Number of denoising steps passed to model.sample_actions.
     num_steps: int = 10
-    # Optional PyTorch attention backend override, for example eager or sdpa.
-    attn_implementation: str | None = None
     # Optional torch.compile mode override, for example reduce-overhead or max-autotune.
     compile_mode: str | None = None
     # Disable torch.compile for sample_actions.
@@ -112,16 +110,6 @@ def main(args: Args) -> None:
     logging.basicConfig(level=logging.INFO, force=True)
 
     train_config = _config.get_config(args.config_name)
-    if args.attn_implementation is not None:
-        if not hasattr(train_config.model, "pytorch_attn_implementation"):
-            raise ValueError(f"{args.config_name} does not support PyTorch attention backend overrides.")
-        train_config = dataclasses.replace(
-            train_config,
-            model=dataclasses.replace(
-                train_config.model,
-                pytorch_attn_implementation=args.attn_implementation,
-            ),
-        )
     if args.compile_mode is not None or args.disable_compile:
         if not hasattr(train_config.model, "pytorch_compile_mode"):
             raise ValueError(f"{args.config_name} does not support PyTorch compile mode overrides.")
@@ -175,7 +163,6 @@ def main(args: Args) -> None:
         "warmup_iters": args.warmup_iters,
         "iters": args.iters,
         "num_steps": args.num_steps,
-        "attn_implementation": args.attn_implementation,
         "compile_mode": None if args.disable_compile else args.compile_mode,
         "disable_compile": args.disable_compile,
         "fixed_noise": args.fixed_noise,
