@@ -244,6 +244,40 @@ uv run python scripts/benchmark_pi05_libero_latency.py \
   --output-json /tmp/pi05_libero_latency_sdpa.json
 ```
 
+Current compile-mode comparison commands:
+
+```bash
+uv run python scripts/benchmark_pi05_libero_latency.py \
+  --config-name pi05_libero \
+  --checkpoint-dir gs://openpi-assets/checkpoints/pi05_libero \
+  --device cuda \
+  --warmup-iters 10 \
+  --iters 100 \
+  --num-steps 10 \
+  --disable-compile \
+  --output-json /tmp/pi05_libero_latency_no_compile.json
+
+uv run python scripts/benchmark_pi05_libero_latency.py \
+  --config-name pi05_libero \
+  --checkpoint-dir gs://openpi-assets/checkpoints/pi05_libero \
+  --device cuda \
+  --warmup-iters 10 \
+  --iters 100 \
+  --num-steps 10 \
+  --compile-mode reduce-overhead \
+  --output-json /tmp/pi05_libero_latency_reduce_overhead.json
+
+uv run python scripts/benchmark_pi05_libero_latency.py \
+  --config-name pi05_libero \
+  --checkpoint-dir gs://openpi-assets/checkpoints/pi05_libero \
+  --device cuda \
+  --warmup-iters 10 \
+  --iters 100 \
+  --num-steps 10 \
+  --compile-mode max-autotune \
+  --output-json /tmp/pi05_libero_latency_max_autotune.json
+```
+
 ## Progress Log
 
 | Date | Commit | Change | Expected Impact | Verification Status | User Feedback |
@@ -254,8 +288,9 @@ uv run python scripts/benchmark_pi05_libero_latency.py \
 | 2026-05-13 | `1d60cf9` | Cache prompt-only tokenization in `TokenizePrompt`. | Reduces repeated CPU tokenization overhead for `pi05_libero`, where `discrete_state_input=False` makes prompt tokens independent of state. | `py_compile` and `git diff --check` passed locally. `pytest` unavailable in system Python and `uv run` is blocked by macOS `jax[cuda12]`; NVIDIA benchmark required for transform latency impact. | Pending. |
 | 2026-05-13 | `44890b7` | Precompute pi05 action suffix masks, position offsets, and timestep embedding basis. | Reduces small tensor construction inside every denoising step and makes the suffix path more static for later compile work. | `py_compile` and `git diff --check` passed locally. NVIDIA benchmark required for latency and correctness. | Pending. |
 | 2026-05-13 | `5c5fc42` | Move fixed attention backend setup out of the inference hot path. | Removes repeated config mutation from prefix encode and every denoise step, reducing Python side effects before compile-region work. | `py_compile` and `git diff --check` passed locally. NVIDIA benchmark required for latency and correctness. | Pending. |
-| 2026-05-14 | pending | Add PyTorch attention backend override for eager-vs-SDPA core forward benchmarking. | Targets VLM and denoise forward math directly instead of Python caching overhead. | `py_compile` and `git diff --check` passed locally. H100/Jetson eager-vs-SDPA benchmark required. | Pending. |
-| 2026-05-14 | pending | Replace tensor-valued denoising `while` loop with static integer `for range(num_steps)`. | Preserves the timestep schedule while making the repeated denoise forward path friendlier to TorchInductor and TensorRT graph capture. | `py_compile` and `git diff --check` passed locally. Fixed-noise H100/Jetson correctness and latency benchmark required. | Pending. |
+| 2026-05-14 | `3502880` | Add PyTorch attention backend override for eager-vs-SDPA core forward benchmarking. | Targets VLM and denoise forward math directly instead of Python caching overhead. | `py_compile` and `git diff --check` passed locally. H100/Jetson eager-vs-SDPA benchmark required. | Pending. |
+| 2026-05-14 | `e962ad1` | Replace tensor-valued denoising `while` loop with static integer `for range(num_steps)`. | Preserves the timestep schedule while making the repeated denoise forward path friendlier to TorchInductor and TensorRT graph capture. | `py_compile` and `git diff --check` passed locally. Fixed-noise H100/Jetson correctness and latency benchmark required. | Pending. |
+| 2026-05-14 | pending | Add PyTorch compile-mode override for no-compile, `reduce-overhead`, and `max-autotune` benchmarks. | Measures graph conversion cost and steady-state latency explicitly on H100 and Jetson Thor instead of assuming one compile mode is best. | `py_compile` and `git diff --check` passed locally. H100/Jetson compile-mode benchmark required. | Pending. |
 
 ## Commit And Update Rule
 

@@ -34,6 +34,8 @@ class Pi0Config(_model.BaseModelConfig):
     # PyTorch-only attention backend for PaliGemma/Gemma forward passes. Use this to benchmark core model math
     # implementations such as eager attention and SDPA without changing checkpoint weights.
     pytorch_attn_implementation: str = "eager"
+    # PyTorch-only torch.compile mode for action sampling. Set to None to disable compilation.
+    pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
         if self.max_token_len is None:

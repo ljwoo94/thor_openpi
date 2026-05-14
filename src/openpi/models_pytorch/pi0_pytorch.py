@@ -133,7 +133,8 @@ class PI0Pytorch(nn.Module):
         )
 
         torch.set_float32_matmul_precision("high")
-        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+        if config.pytorch_compile_mode is not None:
+            self.sample_actions = torch.compile(self.sample_actions, mode=config.pytorch_compile_mode)
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False

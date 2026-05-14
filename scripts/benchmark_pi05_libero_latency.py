@@ -36,6 +36,10 @@ class Args:
     num_steps: int = 10
     # Optional PyTorch attention backend override, for example eager or sdpa.
     attn_implementation: str | None = None
+    # Optional torch.compile mode override, for example reduce-overhead or max-autotune.
+    compile_mode: str | None = None
+    # Disable torch.compile for sample_actions.
+    disable_compile: bool = False
     # Random seed for deterministic synthetic LIBERO inputs and optional noise.
     seed: int = 0
     # Use fixed noise for every measured call to make correctness comparisons easier.
@@ -118,6 +122,16 @@ def main(args: Args) -> None:
                 pytorch_attn_implementation=args.attn_implementation,
             ),
         )
+    if args.compile_mode is not None or args.disable_compile:
+        if not hasattr(train_config.model, "pytorch_compile_mode"):
+            raise ValueError(f"{args.config_name} does not support PyTorch compile mode overrides.")
+        train_config = dataclasses.replace(
+            train_config,
+            model=dataclasses.replace(
+                train_config.model,
+                pytorch_compile_mode=None if args.disable_compile else args.compile_mode,
+            ),
+        )
     sample_kwargs = {"num_steps": args.num_steps}
     policy = policy_config.create_trained_policy(
         train_config,
@@ -162,6 +176,8 @@ def main(args: Args) -> None:
         "iters": args.iters,
         "num_steps": args.num_steps,
         "attn_implementation": args.attn_implementation,
+        "compile_mode": None if args.disable_compile else args.compile_mode,
+        "disable_compile": args.disable_compile,
         "fixed_noise": args.fixed_noise,
         "hardware": _hardware_info(device),
         "total_policy_infer_ms": _stats(total_ms),
