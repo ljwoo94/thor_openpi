@@ -447,20 +447,17 @@ class PI0Pytorch(nn.Module):
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
         x_t = noise
-        time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        while time >= -dt / 2:
-            expanded_time = time.expand(bsize)
+        for step in range(num_steps):
+            time = torch.full((bsize,), 1.0 - step / num_steps, dtype=torch.float32, device=device)
             v_t = self.denoise_step(
                 state,
                 prefix_pad_masks,
                 past_key_values,
                 x_t,
-                expanded_time,
+                time,
             )
 
-            # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
-            time += dt
         return x_t
 
     def denoise_step(
