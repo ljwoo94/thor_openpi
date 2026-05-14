@@ -161,16 +161,15 @@ NVIDIA verification:
 
 ## Detailed Implementation Order
 
-1. Add baseline benchmark script and document how users should run it on H100 and Jetson Thor.
-2. Use the baseline to collect unoptimized numbers from the user.
-3. Add policy-level timing breakdown and `torch.inference_mode()`.
-4. Optimize tensor conversion and prompt tokenization cache.
-5. Precompute static tensors for `pi05_libero` default serving shapes.
-6. Split and tune `torch.compile` regions.
-7. Evaluate attention backend changes.
-8. Add custom Triton kernels only for measured hot spots.
-9. Evaluate FP8 and TensorRT/Torch-TensorRT on Jetson Thor and H100.
-10. Start architecture/distillation track only after checkpoint-safe gains plateau.
+1. Benchmark core model math first: prefix VLM forward, Gemma expert denoise-step forward, and attention backend.
+2. Compare eager attention against SDPA on H100 and Jetson Thor.
+3. Measure denoising-step count sensitivity with `--num-steps 10`, `8`, `6`, and `5`; accept only with rollout quality.
+4. Split and tune static compiled regions around prefix forward and a single denoise step.
+5. Add custom Triton kernels only for measured hot spots inside attention, adaRMSNorm, MLP, or residual math.
+6. Evaluate FP8 and TensorRT/Torch-TensorRT on Jetson Thor and H100.
+7. Start architecture/distillation track after checkpoint-safe compute optimizations plateau.
+
+Python-level caching and input transform work is secondary. Do not add more conditionals inside denoising or VLM hot paths unless the branch is outside the compiled/static function boundary.
 
 ## Current Implementation Backlog
 
@@ -182,6 +181,7 @@ NVIDIA verification:
 | P1 | Avoid redundant numpy copies | `src/openpi/policies/policy.py` | Shape/dtype tests and benchmark |
 | P2 | Prompt-token cache | `src/openpi/transforms.py` or policy-local wrapper | Repeated prompt cache hit test |
 | P2 | Static suffix masks/timestep schedule | `src/openpi/models_pytorch/pi0_pytorch.py` | Fixed-noise equivalence and allocation reduction |
+| P2 | Attention backend override | `src/openpi/models/pi0_config.py`, `src/openpi/models_pytorch/pi0_pytorch.py` | H100/Jetson eager vs SDPA benchmark |
 | P3 | Compile-region split | `src/openpi/models_pytorch/pi0_pytorch.py` | H100 and Jetson P50/P95 |
 | P3 | Attention backend experiments | PyTorch Gemma/PaliGemma config path | Correctness and benchmark |
 | P4 | Triton fused kernels | new or model-local kernel module | Kernel-level and end-to-end benchmark |
@@ -220,6 +220,30 @@ uv run python scripts/benchmark_pi05_libero_latency.py \
   --output-json /tmp/pi05_libero_latency.json
 ```
 
+Current core-attention comparison commands:
+
+```bash
+uv run python scripts/benchmark_pi05_libero_latency.py \
+  --config-name pi05_libero \
+  --checkpoint-dir gs://openpi-assets/checkpoints/pi05_libero \
+  --device cuda \
+  --warmup-iters 10 \
+  --iters 100 \
+  --num-steps 10 \
+  --attn-implementation eager \
+  --output-json /tmp/pi05_libero_latency_eager.json
+
+uv run python scripts/benchmark_pi05_libero_latency.py \
+  --config-name pi05_libero \
+  --checkpoint-dir gs://openpi-assets/checkpoints/pi05_libero \
+  --device cuda \
+  --warmup-iters 10 \
+  --iters 100 \
+  --num-steps 10 \
+  --attn-implementation sdpa \
+  --output-json /tmp/pi05_libero_latency_sdpa.json
+```
+
 ## Progress Log
 
 | Date | Commit | Change | Expected Impact | Verification Status | User Feedback |
@@ -230,6 +254,7 @@ uv run python scripts/benchmark_pi05_libero_latency.py \
 | 2026-05-13 | `1d60cf9` | Cache prompt-only tokenization in `TokenizePrompt`. | Reduces repeated CPU tokenization overhead for `pi05_libero`, where `discrete_state_input=False` makes prompt tokens independent of state. | `py_compile` and `git diff --check` passed locally. `pytest` unavailable in system Python and `uv run` is blocked by macOS `jax[cuda12]`; NVIDIA benchmark required for transform latency impact. | Pending. |
 | 2026-05-13 | `44890b7` | Precompute pi05 action suffix masks, position offsets, and timestep embedding basis. | Reduces small tensor construction inside every denoising step and makes the suffix path more static for later compile work. | `py_compile` and `git diff --check` passed locally. NVIDIA benchmark required for latency and correctness. | Pending. |
 | 2026-05-13 | `5c5fc42` | Move fixed attention backend setup out of the inference hot path. | Removes repeated config mutation from prefix encode and every denoise step, reducing Python side effects before compile-region work. | `py_compile` and `git diff --check` passed locally. NVIDIA benchmark required for latency and correctness. | Pending. |
+| 2026-05-14 | pending | Add PyTorch attention backend override for eager-vs-SDPA core forward benchmarking. | Targets VLM and denoise forward math directly instead of Python caching overhead. | `py_compile` and `git diff --check` passed locally. H100/Jetson eager-vs-SDPA benchmark required. | Pending. |
 
 ## Commit And Update Rule
 

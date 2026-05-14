@@ -34,6 +34,8 @@ class Args:
     iters: int = 50
     # Number of denoising steps passed to model.sample_actions.
     num_steps: int = 10
+    # Optional PyTorch attention backend override, for example eager or sdpa.
+    attn_implementation: str | None = None
     # Random seed for deterministic synthetic LIBERO inputs and optional noise.
     seed: int = 0
     # Use fixed noise for every measured call to make correctness comparisons easier.
@@ -106,6 +108,16 @@ def main(args: Args) -> None:
     logging.basicConfig(level=logging.INFO, force=True)
 
     train_config = _config.get_config(args.config_name)
+    if args.attn_implementation is not None:
+        if not hasattr(train_config.model, "pytorch_attn_implementation"):
+            raise ValueError(f"{args.config_name} does not support PyTorch attention backend overrides.")
+        train_config = dataclasses.replace(
+            train_config,
+            model=dataclasses.replace(
+                train_config.model,
+                pytorch_attn_implementation=args.attn_implementation,
+            ),
+        )
     sample_kwargs = {"num_steps": args.num_steps}
     policy = policy_config.create_trained_policy(
         train_config,
@@ -149,6 +161,7 @@ def main(args: Args) -> None:
         "warmup_iters": args.warmup_iters,
         "iters": args.iters,
         "num_steps": args.num_steps,
+        "attn_implementation": args.attn_implementation,
         "fixed_noise": args.fixed_noise,
         "hardware": _hardware_info(device),
         "total_policy_infer_ms": _stats(total_ms),
