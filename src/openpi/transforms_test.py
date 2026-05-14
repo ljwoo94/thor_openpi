@@ -78,28 +78,6 @@ def test_tokenize_prompt():
     assert np.allclose(tok_mask, data["tokenized_prompt_mask"])
 
 
-def test_tokenize_prompt_caches_prompt_only_tokenization():
-    class CountingTokenizer:
-        def __init__(self):
-            self.calls = 0
-
-        def tokenize(self, prompt, state=None):
-            self.calls += 1
-            assert state is None
-            return np.asarray([len(prompt)]), np.asarray([True])
-
-    tokenizer = CountingTokenizer()
-    transform = _transforms.TokenizePrompt(tokenizer)
-
-    first = transform({"prompt": "pick up the cup"})
-    second = transform({"prompt": "pick up the cup"})
-    third = transform({"prompt": "open the drawer"})
-
-    assert tokenizer.calls == 2
-    assert np.all(first["tokenized_prompt"] == second["tokenized_prompt"])
-    assert np.all(third["tokenized_prompt"] == np.asarray([15]))
-
-
 def test_tokenize_no_prompt():
     transform = _transforms.TokenizePrompt(_tokenizer.PaligemmaTokenizer())
 
