@@ -33,6 +33,8 @@ class Pi0Config(_model.BaseModelConfig):
     discrete_state_input: bool = None  # type: ignore
     # PyTorch-only torch.compile mode for action sampling. Set to None to disable compilation.
     pytorch_compile_mode: str | None = "max-autotune"
+    # PyTorch-only image keys for inference/training. Set to None to use the default camera set.
+    pytorch_image_keys: tuple[str, ...] | None = None
 
     def __post_init__(self):
         if self.max_token_len is None:

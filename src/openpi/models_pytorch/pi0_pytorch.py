@@ -163,7 +163,8 @@ class PI0Pytorch(nn.Module):
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
-        observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
+        image_keys = self.config.pytorch_image_keys or _preprocessing.IMAGE_KEYS
+        observation = _preprocessing.preprocess_observation_pytorch(observation, train=train, image_keys=image_keys)
         return (
             list(observation.images.values()),
             list(observation.image_masks.values()),

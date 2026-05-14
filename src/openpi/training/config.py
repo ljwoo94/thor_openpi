@@ -742,7 +742,12 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_libero",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            pytorch_image_keys=("base_0_rgb", "left_wrist_0_rgb"),
+        ),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),

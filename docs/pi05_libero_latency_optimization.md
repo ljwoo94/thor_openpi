@@ -164,14 +164,44 @@ NVIDIA verification:
 ## Detailed Implementation Order
 
 1. Benchmark core model math first: prefix VLM forward and Gemma expert denoise-step forward.
-2. Keep eager attention for the PyTorch path; pursue attention speed through TensorRT/QDQ/plugin paths instead of generic SDPA.
-3. Measure denoising-step count sensitivity with `--num-steps 10`, `8`, `6`, and `5`; accept only with rollout quality.
-4. Split and tune static compiled regions around prefix forward and a single denoise step.
-5. Add custom Triton kernels only for measured hot spots inside attention, adaRMSNorm, MLP, or residual math.
-6. Evaluate FP8 and TensorRT/Torch-TensorRT on Jetson Thor and H100.
-7. Start architecture/distillation track after checkpoint-safe compute optimizations plateau.
+2. Remove known padded LIBERO camera slots with a static config image-key subset before trying deeper kernel work.
+3. Keep eager attention for the PyTorch path; pursue attention speed through TensorRT/QDQ/plugin paths instead of generic SDPA.
+4. Measure denoising-step count sensitivity with `--num-steps 10`, `8`, `6`, and `5`; accept only with rollout quality.
+5. Split and tune static compiled regions around prefix forward and a single denoise step.
+6. Add custom Triton kernels only for measured hot spots inside attention, adaRMSNorm, MLP, or residual math.
+7. Evaluate FP8 and TensorRT/Torch-TensorRT on Jetson Thor and H100.
+8. Start architecture/distillation track after checkpoint-safe compute optimizations plateau.
 
 Python-level caching and input transform work is secondary. Do not add more conditionals inside denoising or VLM hot paths unless the branch is outside the compiled/static function boundary.
+
+### Current Core-Compute Plan
+
+The next optimization steps must target the two confirmed bottlenecks: `language_model.forward` in the prefix/VLM path and the repeated denoising forward path.
+
+1. Static LIBERO camera subset
+   - `pi05_libero` has a padded/unused right-wrist image slot in the PyTorch serving input.
+   - Configure the PyTorch model path to consume only `("base_0_rgb", "left_wrist_0_rgb")`.
+   - Expected impact: removes one SigLIP vision-tower call and one image-token block from the PaliGemma prefix pass.
+   - Risk: prefix sequence length and position ids change. The removed slot should be masked/padded, but fixed-noise action comparison and LIBERO rollout quality still need user verification.
+
+2. Denoising-step count sweep
+   - Run the existing benchmark with `--num-steps 10`, `8`, `6`, and `5`.
+   - Expected impact: roughly linear reduction in total denoising cost if rollout quality tolerates fewer steps.
+   - Risk: lower action quality. Do not accept by latency alone.
+
+3. Static compiled denoise step
+   - Keep the outer loop static and compile the repeated denoise body only after the camera subset is validated.
+   - Avoid Python conditionals inside the compiled function.
+   - Expected impact: better TorchInductor fusion and lower per-step launch overhead.
+
+4. TensorRT/FP8 coverage expansion
+   - Use the QDQ coverage report to identify unquantized high-cost linear/MLP/action-expert layers.
+   - Expand quantization only where ModelOpt/TensorRT supports the op without accuracy collapse.
+   - Expected impact: faster `language_model.forward` and denoise expert layers on Thor/H100.
+
+5. Kernel-specific fusion
+   - Profile first, then consider Triton or TensorRT plugins for measured hot spots such as adaRMSNorm, gated residual, and small projection blocks.
+   - Expected impact: useful only if these kernels are visible in the profiler after attention/MLP quantization and graph conversion.
 
 ## Current Implementation Backlog
 
@@ -181,6 +211,7 @@ Python-level caching and input transform work is secondary. Do not add more cond
 | P0 | Progress doc update on every change | `docs/pi05_libero_latency_optimization.md` | Commit includes doc update |
 | P1 | `torch.inference_mode()` and timing breakdown | `src/openpi/policies/policy.py` | Fixed-noise equivalence and timing output |
 | P1 | Avoid redundant numpy copies | `src/openpi/policies/policy.py` | Shape/dtype tests and benchmark |
+| P1 | Static LIBERO camera subset | `src/openpi/models/pi0_config.py`, `src/openpi/models_pytorch/pi0_pytorch.py`, `src/openpi/training/config.py` | Fixed-noise action comparison, H100/Jetson latency, rollout quality |
 | P2 | Prompt-token cache | `src/openpi/transforms.py` or policy-local wrapper | Repeated prompt cache hit test |
 | P2 | Static suffix masks/timestep schedule | `src/openpi/models_pytorch/pi0_pytorch.py` | Fixed-noise equivalence and allocation reduction |
 | P2 | Attention acceleration | TensorRT/QDQ/plugin path | Avoid generic SDPA unless patched mask/bias dtypes are fixed |
