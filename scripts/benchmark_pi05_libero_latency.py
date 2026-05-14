@@ -34,6 +34,8 @@ class Args:
     iters: int = 50
     # Number of denoising steps passed to model.sample_actions.
     num_steps: int = 10
+    # Optional comma-separated denoising-step sweep, for example "10,8,6,5".
+    num_steps_sweep: str | None = None
     # Optional torch.compile mode override, for example reduce-overhead or max-autotune.
     compile_mode: str | None = None
     # Disable torch.compile for sample_actions.
@@ -106,9 +108,18 @@ def _make_noise(seed: int, action_horizon: int, action_dim: int) -> np.ndarray:
     return rng.standard_normal((action_horizon, action_dim), dtype=np.float32)
 
 
-def main(args: Args) -> None:
-    logging.basicConfig(level=logging.INFO, force=True)
+def _parse_num_steps(args: Args) -> list[int]:
+    if args.num_steps_sweep is None:
+        return [args.num_steps]
+    steps = [int(value.strip()) for value in args.num_steps_sweep.split(",") if value.strip()]
+    if not steps:
+        raise ValueError("--num-steps-sweep must contain at least one integer step count.")
+    if any(step <= 0 for step in steps):
+        raise ValueError("--num-steps-sweep values must be positive.")
+    return steps
 
+
+def _run_benchmark(args: Args, num_steps: int) -> dict[str, Any]:
     train_config = _config.get_config(args.config_name)
     if args.compile_mode is not None or args.disable_compile:
         if not hasattr(train_config.model, "pytorch_compile_mode"):
@@ -120,7 +131,7 @@ def main(args: Args) -> None:
                 pytorch_compile_mode=None if args.disable_compile else args.compile_mode,
             ),
         )
-    sample_kwargs = {"num_steps": args.num_steps}
+    sample_kwargs = {"num_steps": num_steps}
     policy = policy_config.create_trained_policy(
         train_config,
         args.checkpoint_dir,
@@ -138,7 +149,7 @@ def main(args: Args) -> None:
         noise = _make_noise(args.seed + 1, train_config.model.action_horizon, train_config.model.action_dim)
 
     logger.info("Hardware: %s", json.dumps(_hardware_info(device), indent=2))
-    logger.info("Warming up for %d iterations", args.warmup_iters)
+    logger.info("Warming up for %d iterations with num_steps=%d", args.warmup_iters, num_steps)
     for _ in range(args.warmup_iters):
         _sync_if_needed(device)
         policy.infer(obs, noise=noise)
@@ -147,7 +158,7 @@ def main(args: Args) -> None:
     total_ms: list[float] = []
     policy_timings: dict[str, list[float]] = {}
 
-    logger.info("Measuring %d iterations", args.iters)
+    logger.info("Measuring %d iterations with num_steps=%d", args.iters, num_steps)
     for _ in range(args.iters):
         _sync_if_needed(device)
         start = time.perf_counter()
@@ -162,7 +173,7 @@ def main(args: Args) -> None:
         "checkpoint_dir": args.checkpoint_dir,
         "warmup_iters": args.warmup_iters,
         "iters": args.iters,
-        "num_steps": args.num_steps,
+        "num_steps": num_steps,
         "compile_mode": None if args.disable_compile else args.compile_mode,
         "disable_compile": args.disable_compile,
         "fixed_noise": args.fixed_noise,
@@ -170,6 +181,28 @@ def main(args: Args) -> None:
         "total_policy_infer_ms": _stats(total_ms),
         "policy_timing_ms": {key: _stats(values) for key, values in sorted(policy_timings.items())},
     }
+    return summary
+
+
+def main(args: Args) -> None:
+    logging.basicConfig(level=logging.INFO, force=True)
+
+    steps = _parse_num_steps(args)
+    summaries = [_run_benchmark(args, num_steps) for num_steps in steps]
+    summary: dict[str, Any]
+    if len(summaries) == 1:
+        summary = summaries[0]
+    else:
+        summary = {
+            "config_name": args.config_name,
+            "checkpoint_dir": args.checkpoint_dir,
+            "num_steps_sweep": steps,
+            "compile_mode": None if args.disable_compile else args.compile_mode,
+            "disable_compile": args.disable_compile,
+            "fixed_noise": args.fixed_noise,
+            "hardware": summaries[0]["hardware"],
+            "results": summaries,
+        }
 
     print(json.dumps(summary, indent=2))
     if args.output_json is not None:

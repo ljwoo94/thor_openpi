@@ -5,7 +5,7 @@ import fnmatch
 import os
 import sys
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Any, Sequence, Tuple
 
 import torch
 import torch.onnx
@@ -262,12 +262,17 @@ def report_onnx_qdq_coverage(onnx_path: str) -> None:
         print(f"    QDQ pairs per compute node: {min(quantize_count, dequantize_count) / compute_count:.2f}")
 
 
-def _create_observation_from_inputs(images, img_masks, state, lang_tokens, lang_masks):
+def _get_pytorch_image_keys(model_config) -> tuple[str, ...]:
+    """Return the static PyTorch image keys used by the model/export path."""
+    return tuple(getattr(model_config, "pytorch_image_keys", None) or IMAGE_KEYS)
+
+
+def _create_observation_from_inputs(images, img_masks, state, lang_tokens, lang_masks, image_keys: Sequence[str]):
     """Helper function to create Observation from tensor inputs."""
     from openpi.models.model import Observation
 
-    images_dict = {IMAGE_KEYS[i]: images[:, i * 3 : (i + 1) * 3] for i in range(len(IMAGE_KEYS))}
-    image_masks_dict = {IMAGE_KEYS[i]: img_masks[:, i] for i in range(len(IMAGE_KEYS))}
+    images_dict = {key: images[:, i * 3 : (i + 1) * 3] for i, key in enumerate(image_keys)}
+    image_masks_dict = {key: img_masks[:, i] for i, key in enumerate(image_keys)}
 
     return Observation(
         images=images_dict,
@@ -344,6 +349,7 @@ class ONNXWrapper(torch.nn.Module):
         super().__init__()
         self.model = model
         self.num_steps = num_steps
+        self.image_keys = _get_pytorch_image_keys(model.config)
 
     def forward(self, images, img_masks, lang_tokens, lang_masks, state, noise):
         """Forward pass that converts tensor inputs to Observation format and calls model.sample_actions.
@@ -359,7 +365,7 @@ class ONNXWrapper(torch.nn.Module):
         Returns:
             Model output actions
         """
-        observation = _create_observation_from_inputs(images, img_masks, state, lang_tokens, lang_masks)
+        observation = _create_observation_from_inputs(images, img_masks, state, lang_tokens, lang_masks, self.image_keys)
         return self.model.sample_actions(images.device, observation, noise=noise, num_steps=self.num_steps)
 
 
@@ -378,7 +384,8 @@ def _create_dummy_inputs(
     Returns:
         Tuple of dummy input tensors
     """
-    num_images = len(IMAGE_KEYS)
+    image_keys = _get_pytorch_image_keys(model_config)
+    num_images = len(image_keys)
     image_size = IMAGE_RESOLUTION[0]
     action_horizon = model_config.action_horizon
     action_dim = model_config.action_dim
@@ -409,6 +416,7 @@ def _create_dummy_inputs(
     print(
         f"  Dummy inputs created: images={dummy_inputs[0].shape} (dtype={compute_dtype}), noise={dummy_inputs[5].shape} (dtype={compute_dtype})"
     )
+    print(f"  Export image keys: {image_keys}")
     return dummy_inputs
 
 

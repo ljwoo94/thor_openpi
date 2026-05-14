@@ -183,6 +183,7 @@ The next optimization steps must target the two confirmed bottlenecks: `language
    - Configure the PyTorch model path to consume only `("base_0_rgb", "left_wrist_0_rgb")`.
    - Expected impact: removes one SigLIP vision-tower call and one image-token block from the PaliGemma prefix pass.
    - Risk: prefix sequence length and position ids change. The removed slot should be masked/padded, but fixed-noise action comparison and LIBERO rollout quality still need user verification.
+   - Deployment follow-up: the Thor ONNX wrapper and dummy inputs should use the same image-key subset so TensorRT builds a two-camera prefix graph instead of preserving an unused 9-channel input.
 
 2. Denoising-step count sweep
    - Run the existing benchmark with `--num-steps 10`, `8`, `6`, and `5`.
@@ -212,6 +213,7 @@ The next optimization steps must target the two confirmed bottlenecks: `language
 | P1 | `torch.inference_mode()` and timing breakdown | `src/openpi/policies/policy.py` | Fixed-noise equivalence and timing output |
 | P1 | Avoid redundant numpy copies | `src/openpi/policies/policy.py` | Shape/dtype tests and benchmark |
 | P1 | Static LIBERO camera subset | `src/openpi/models/pi0_config.py`, `src/openpi/models_pytorch/pi0_pytorch.py`, `src/openpi/training/config.py` | Fixed-noise action comparison, H100/Jetson latency, rollout quality |
+| P1 | Denoising-step sweep benchmark | `scripts/benchmark_pi05_libero_latency.py` | H100/Jetson latency and LIBERO rollout quality for each step count |
 | P2 | Prompt-token cache | `src/openpi/transforms.py` or policy-local wrapper | Repeated prompt cache hit test |
 | P2 | Static suffix masks/timestep schedule | `src/openpi/models_pytorch/pi0_pytorch.py` | Fixed-noise equivalence and allocation reduction |
 | P2 | Attention acceleration | TensorRT/QDQ/plugin path | Avoid generic SDPA unless patched mask/bias dtypes are fixed |
@@ -287,6 +289,20 @@ uv run python scripts/benchmark_pi05_libero_latency.py \
   --output-json /tmp/pi05_libero_latency_max_autotune.json
 ```
 
+Current denoising-step sweep command:
+
+```bash
+uv run python scripts/benchmark_pi05_libero_latency.py \
+  --config-name pi05_libero \
+  --checkpoint-dir gs://openpi-assets/checkpoints/pi05_libero \
+  --device cuda \
+  --warmup-iters 10 \
+  --iters 100 \
+  --num-steps-sweep 10,8,6,5 \
+  --compile-mode reduce-overhead \
+  --output-json /tmp/pi05_libero_latency_steps_sweep.json
+```
+
 ## Progress Log
 
 | Date | Commit | Change | Expected Impact | Verification Status | User Feedback |
@@ -305,6 +321,8 @@ uv run python scripts/benchmark_pi05_libero_latency.py \
 | 2026-05-14 | `6690d5e` | Make Thor ONNX export denoise loop static and remove export hot-path attention config mutation. | Improves TensorRT/ONNX graph conversion for the real repeated denoise forward instead of Python-side preprocessing. | `py_compile` and `git diff --check` passed locally. Thor export and TensorRT build required. | Pending. |
 | 2026-05-14 | `188c6aa` | Revert batched vision prefix while keeping QDQ coverage, and add static-shape ONNX export option. | Avoids compile-breaking prefix logic and gives TensorRT a fixed-shape export path for stronger engine optimization. | `py_compile` and `git diff --check` passed locally. Thor static-shape export and engine build required. | Requested after compile conversion failure. |
 | 2026-05-14 | `ba46cce` | Remove unusable SDPA benchmark/config switch and keep eager attention in PyTorch path. | Prevents invalid benchmark paths and keeps attention optimization focused on QDQ/TensorRT/plugin routes. | `py_compile` and `git diff --check` passed locally. | Requested after SDPA dtype failure. |
+| 2026-05-14 | `cc0f29a` | Add a PyTorch-only image-key subset and configure `pi05_libero` to skip the padded right-wrist camera slot. | Removes one vision-tower image forward and one image-token block from the prefix `language_model.forward` input. | `py_compile` and `git diff --check` passed locally. H100/Jetson fixed-noise action comparison, latency, and LIBERO rollout verification required. | Pending. |
+| 2026-05-14 | pending | Add denoising-step sweep support to the benchmark and make Thor ONNX export use the configured PyTorch image-key subset. | Lets the user measure total denoising-cost scaling and lets TensorRT export avoid the unused LIBERO camera input. | `py_compile` and `git diff --check` passed locally. `uv run ... --help` is blocked on Apple Silicon by the pinned `jax-cuda12-plugin`; H100/Jetson benchmark and Thor export required. | Pending. |
 
 ## Commit And Update Rule
 
