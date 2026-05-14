@@ -755,6 +755,7 @@ def export_to_onnx(
     num_calibration_samples: int = 32,
     enable_llm_nvfp4: bool = False,
     quantize_attention_matmul: bool = True,
+    static_shapes: bool = False,
 ) -> torch.nn.Module:
     """
     Export PyTorch model to ONNX format.
@@ -770,6 +771,7 @@ def export_to_onnx(
         num_calibration_samples: Number of calibration samples for FP8 (default: 32)
         enable_llm_nvfp4: Enable NVFP4 quantization for LLM layers (default: False)
         quantize_attention_matmul: Enable QDQ nodes for attention matmul operations (default: True)
+        static_shapes: Export fixed batch/token/noise shapes for stronger TensorRT optimization.
 
     Returns:
         Exported model
@@ -811,6 +813,17 @@ def export_to_onnx(
     onnx_path = onnx_dir / onnx_filename
 
     print(f"\nExporting to: {onnx_path}")
+    dynamic_axes = None
+    if not static_shapes:
+        dynamic_axes = {
+            "images": {0: "batch_size"},
+            "img_masks": {0: "batch_size"},
+            "lang_tokens": {0: "batch_size", 1: "seq_len"},
+            "lang_masks": {0: "batch_size", 1: "seq_len"},
+            "state": {0: "batch_size"},
+            "noise": {0: "batch_size"},
+            "actions": {0: "batch_size"},
+        }
 
     with torch.no_grad():
         torch.onnx.export(
@@ -829,15 +842,7 @@ def export_to_onnx(
                 "noise",
             ],
             output_names=["actions"],
-            dynamic_axes={
-                "images": {0: "batch_size"},
-                "img_masks": {0: "batch_size"},
-                "lang_tokens": {0: "batch_size", 1: "seq_len"},
-                "lang_masks": {0: "batch_size", 1: "seq_len"},
-                "state": {0: "batch_size"},
-                "noise": {0: "batch_size"},
-                "actions": {0: "batch_size"},
-            },
+            dynamic_axes=dynamic_axes,
         )
         postprocess_onnx_model(onnx_path, enable_llm_nvfp4)
         report_onnx_qdq_coverage(str(onnx_path))
@@ -854,6 +859,7 @@ def export_checkpoint_to_onnx(
     num_calibration_samples: int = 32,
     enable_llm_nvfp4: bool = False,
     quantize_attention_matmul: bool = True,
+    static_shapes: bool = False,
 ) -> torch.nn.Module:
     """
     Export a trained model checkpoint to ONNX format.
@@ -867,6 +873,7 @@ def export_checkpoint_to_onnx(
         num_calibration_samples: Number of samples to use for FP8 calibration (default: 32)
         enable_llm_nvfp4: Enable NVFP4 quantization for LLM layers (default: False)
         quantize_attention_matmul: Enable QDQ nodes for attention matmul operations (default: True)
+        static_shapes: Export fixed shapes for TensorRT optimization.
 
     Returns:
         Exported model
@@ -891,6 +898,7 @@ def export_checkpoint_to_onnx(
         num_calibration_samples=num_calibration_samples,
         enable_llm_nvfp4=enable_llm_nvfp4,
         quantize_attention_matmul=quantize_attention_matmul,
+        static_shapes=static_shapes,
     )
 
     print(f"  ONNX model saved to: {output_path}/onnx/")
@@ -943,6 +951,11 @@ def main():
         action="store_true",
         help="Enable QDQ nodes for attention matmul operations (only applies with --precision fp8)",
     )
+    parser.add_argument(
+        "--static_shapes",
+        action="store_true",
+        help="Export ONNX with fixed batch/token/noise shapes instead of dynamic axes for TensorRT optimization",
+    )
 
     args = parser.parse_args()
 
@@ -956,6 +969,7 @@ def main():
             num_calibration_samples=args.num_calibration_samples,
             enable_llm_nvfp4=args.enable_llm_nvfp4,
             quantize_attention_matmul=args.quantize_attention_matmul,
+            static_shapes=args.static_shapes,
         )
     except Exception as e:
         print(f"Export failed: {e}")

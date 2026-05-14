@@ -197,25 +197,20 @@ class PI0Pytorch(nn.Module):
         pad_masks = []
         att_masks = []
 
-        # Process images
-        if images:
-            bsize = images[0].shape[0]
+        for img, img_mask in zip(images, img_masks, strict=True):
 
             def image_embed_func(img):
                 return self.paligemma_with_expert.embed_image(img)
 
-            batched_images = torch.cat(images, dim=0)
-            batched_img_emb = self._apply_checkpoint(image_embed_func, batched_images)
-            num_img_embs = batched_img_emb.shape[1]
-            batched_img_emb = batched_img_emb.reshape(len(images), bsize, num_img_embs, -1)
+            img_emb = self._apply_checkpoint(image_embed_func, img)
 
-            for image_index, img_mask in enumerate(img_masks):
-                img_emb = batched_img_emb[image_index]
-                embs.append(img_emb)
-                pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+            bsize, num_img_embs = img_emb.shape[:2]
 
-                # Create attention masks so that image tokens attend to each other
-                att_masks += [0] * num_img_embs
+            embs.append(img_emb)
+            pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+
+            # Create attention masks so that image tokens attend to each other
+            att_masks += [0] * num_img_embs
 
         # Process language tokens
         def lang_embed_func(lang_tokens):
