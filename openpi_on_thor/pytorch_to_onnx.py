@@ -426,6 +426,8 @@ def patch_model_for_export(model, compute_dtype=torch.float16):
     import types
 
     model.compute_dtype = compute_dtype
+    model.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
+    model.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"
 
     def make_att_2d_masks_hook(pad_masks, att_masks):
         """TensorRT-compatible version of make_att_2d_masks with explicit int64 casting."""
@@ -500,7 +502,6 @@ def patch_model_for_export(model, compute_dtype=torch.float16):
         prefix_position_ids = torch.cumsum(prefix_pad_masks.to(dtype=torch.int64), dim=1) - 1
 
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
 
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
@@ -510,12 +511,11 @@ def patch_model_for_export(model, compute_dtype=torch.float16):
             use_cache=True,
         )
 
-        dt = -1.0 / num_steps
-        dt_f32 = torch.tensor(dt, dtype=torch.float32, device=device)
+        dt_f32 = torch.tensor(-1.0 / num_steps, dtype=torch.float32, device=device)
 
         x_t = noise.float()
-        time = torch.tensor(1.0, dtype=torch.float32, device=device)
-        while time >= -dt_f32 / 2:
+        for step in range(num_steps):
+            time = torch.full((bsize,), 1.0 - step / num_steps, dtype=torch.float32, device=device)
             expanded_time = time.to(self.compute_dtype).expand(bsize)
             v_t = self.denoise_step(
                 state,
@@ -526,7 +526,6 @@ def patch_model_for_export(model, compute_dtype=torch.float16):
             )
 
             x_t = x_t + dt_f32 * v_t.float()
-            time += dt_f32
         return x_t.to(self.compute_dtype)
 
     def denoise_step_hook(self, state, prefix_pad_masks, past_key_values, x_t, timestep):
@@ -558,7 +557,6 @@ def patch_model_for_export(model, compute_dtype=torch.float16):
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks.to(dtype=torch.int64), dim=1) - 1
 
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
