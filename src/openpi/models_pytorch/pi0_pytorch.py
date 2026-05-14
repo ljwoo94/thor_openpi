@@ -111,27 +111,6 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
-        time_fraction = torch.linspace(0.0, 1.0, action_expert_config.width // 2, dtype=torch.float64)
-        time_period = 4e-3 * (4.0 / 4e-3) ** time_fraction
-        self.register_buffer("_time_embedding_scaling", 1.0 / time_period * 2 * math.pi, persistent=False)
-
-        suffix_att_masks = torch.zeros(config.action_horizon, dtype=torch.bool)
-        suffix_att_masks[0] = True
-        self.register_buffer("_action_suffix_att_masks", suffix_att_masks, persistent=False)
-        self.register_buffer(
-            "_action_suffix_pad_masks",
-            torch.ones(config.action_horizon, dtype=torch.bool),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_action_suffix_att_2d_masks",
-            torch.ones(config.action_horizon, config.action_horizon, dtype=torch.bool),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_action_suffix_position_offsets", torch.arange(config.action_horizon, dtype=torch.long), persistent=False
-        )
-
         torch.set_float32_matmul_precision("high")
         if config.pytorch_compile_mode is not None:
             self.sample_actions = torch.compile(self.sample_actions, mode=config.pytorch_compile_mode)
@@ -207,19 +186,6 @@ class PI0Pytorch(nn.Module):
         time_beta = sample_beta(1.5, 1.0, bsize, device)
         time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
-
-    def _create_time_embedding(self, timestep):
-        scaling = self._time_embedding_scaling.to(
-            device=timestep.device,
-            dtype=get_safe_dtype(torch.float64, timestep.device.type),
-        )
-        sin_input = scaling[None, :] * timestep[:, None]
-        return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1).type(dtype=timestep.dtype)
-
-    def _get_action_suffix_masks(self, batch_size, device):
-        pad_masks = self._action_suffix_pad_masks.to(device=device)[None, :].expand(batch_size, -1)
-        att_masks = self._action_suffix_att_masks.to(device=device)[None, :].expand(batch_size, -1)
-        return pad_masks, att_masks
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks
@@ -303,13 +269,10 @@ class PI0Pytorch(nn.Module):
             att_masks += [1]
 
         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
-        if self.action_in_proj.out_features == self._time_embedding_scaling.numel() * 2:
-            time_emb = self._create_time_embedding(timestep)
-        else:
-            time_emb = create_sinusoidal_pos_embedding(
-                timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0, device=timestep.device
-            )
-            time_emb = time_emb.type(dtype=timestep.dtype)
+        time_emb = create_sinusoidal_pos_embedding(
+            timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0, device=timestep.device
+        )
+        time_emb = time_emb.type(dtype=timestep.dtype)
 
         # Fuse timestep + action information using an MLP
         def action_proj_func(noisy_actions):
@@ -345,22 +308,16 @@ class PI0Pytorch(nn.Module):
         embs.append(action_time_emb)
 
         bsize, action_time_dim = action_time_emb.shape[:2]
-        if action_time_dim == self.config.action_horizon:
-            action_time_mask, action_time_att_masks = self._get_action_suffix_masks(bsize, timestep.device)
-        else:
-            action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
-            action_time_att_masks = torch.zeros(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
-            action_time_att_masks[:, 0] = True
+        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
         pad_masks.append(action_time_mask)
+
+        # Set attention masks so that image, language and state inputs do not attend to action tokens
+        att_masks += [1] + ([0] * (self.config.action_horizon - 1))
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        if att_masks:
-            prefix_att_masks = torch.tensor(att_masks, dtype=torch.bool, device=embs.device)
-            prefix_att_masks = prefix_att_masks[None, :].expand(bsize, len(att_masks))
-            att_masks = torch.cat([prefix_att_masks, action_time_att_masks], dim=1)
-        else:
-            att_masks = action_time_att_masks
+        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
+        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
         return embs, pad_masks, att_masks, adarms_cond
 
@@ -482,20 +439,12 @@ class PI0Pytorch(nn.Module):
 
         prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
 
-        if self.pi05 and suffix_len == self.config.action_horizon:
-            suffix_att_2d_masks = self._action_suffix_att_2d_masks.to(device=suffix_pad_masks.device)
-            suffix_att_2d_masks = suffix_att_2d_masks[None, :, :].expand(batch_size, -1, -1)
-        else:
-            suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
 
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
 
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        if suffix_len == self.config.action_horizon:
-            position_offsets = self._action_suffix_position_offsets.to(device=suffix_pad_masks.device)
-            position_ids = prefix_offsets + position_offsets[None, :]
-        else:
-            position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         # Prepare attention masks
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
