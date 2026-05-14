@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import argparse
+import copy
+import fnmatch
 import os
 import sys
 from pathlib import Path
-from typing import Tuple
+from typing import Any, Tuple
 
 import torch
 import torch.onnx
@@ -130,6 +132,134 @@ def replace_attention_with_quantized_version():
         modeling_gemma._original_eager_attention_forward = modeling_gemma.eager_attention_forward
 
     modeling_gemma.eager_attention_forward = quantized_eager_attention_forward
+
+
+def _is_quant_cfg_enabled(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return True
+    if "enable" in entry:
+        return bool(entry["enable"])
+    return any(_is_quant_cfg_enabled(value) for value in entry.values())
+
+
+def _module_matches_quant_cfg_pattern(name: str, module: torch.nn.Module, pattern: str) -> bool:
+    module_type = type(module)
+    class_name = module_type.__name__
+    qualified_class_name = f"{module_type.__module__}.{class_name}"
+    candidates = {
+        name,
+        class_name,
+        f"nn.{class_name}",
+        qualified_class_name,
+    }
+    return any(fnmatch.fnmatchcase(candidate, pattern) for candidate in candidates)
+
+
+def _collect_quant_cfg_matches(model: torch.nn.Module, quant_cfg: dict) -> dict[str, list[str]]:
+    cfg_entries = quant_cfg.get("quant_cfg", {})
+    matches: dict[str, list[str]] = {}
+    for name, module in model.named_modules():
+        if not name:
+            continue
+        matched_patterns = []
+        for pattern, entry in cfg_entries.items():
+            if pattern.endswith("_quantizer") or not _is_quant_cfg_enabled(entry):
+                continue
+            if _module_matches_quant_cfg_pattern(name, module, pattern):
+                matched_patterns.append(pattern)
+        if matched_patterns:
+            matches[name] = matched_patterns
+    return matches
+
+
+def report_quant_cfg_coverage(model: torch.nn.Module, quant_cfg: dict) -> None:
+    """Report which compute-heavy modules are selected by the ModelOpt quantization config."""
+    matches = _collect_quant_cfg_matches(model, quant_cfg)
+    target_types = (torch.nn.Linear, torch.nn.Conv2d, QuantizedMatMul)
+    target_modules = [(name, module) for name, module in model.named_modules() if isinstance(module, target_types)]
+
+    print("\n  Quantization config coverage:")
+    print(f"    Target compute modules: {len(target_modules)}")
+    matched_modules = [(name, module) for name, module in target_modules if name in matches]
+    print(f"    Matched by enabled quant_cfg entries: {len(matched_modules)}")
+    if target_modules:
+        print(f"    Config coverage: {len(matched_modules) / len(target_modules) * 100:.1f}%")
+
+    by_type: dict[str, list[str]] = {}
+    for name, module in target_modules:
+        by_type.setdefault(type(module).__name__, []).append(name)
+    for type_name, names in sorted(by_type.items()):
+        matched = sum(1 for name in names if name in matches)
+        print(f"    {type_name}: {matched}/{len(names)} matched")
+
+    unmatched = [name for name, _ in target_modules if name not in matches]
+    if unmatched:
+        print("    Unmatched target modules (first 30):")
+        for name in unmatched[:30]:
+            print(f"      - {name}")
+
+
+def _is_enabled_tensor_quantizer(module: torch.nn.Module) -> bool:
+    if not isinstance(module, TensorQuantizer):
+        return False
+    if hasattr(module, "is_enabled"):
+        is_enabled = module.is_enabled
+        return bool(is_enabled() if callable(is_enabled) else is_enabled)
+    if hasattr(module, "_disabled"):
+        return not bool(module._disabled)
+    return True
+
+
+def report_quantized_module_coverage(model: torch.nn.Module) -> None:
+    """Report actual quantized module and TensorQuantizer coverage after ModelOpt calibration."""
+    try:
+        from modelopt.torch.quantization.utils import is_quantized_linear
+    except ImportError:
+        is_quantized_linear = None
+
+    linear_modules = [(name, module) for name, module in model.named_modules() if isinstance(module, torch.nn.Linear)]
+    quantized_linear_names = []
+    if is_quantized_linear is not None:
+        quantized_linear_names = [name for name, module in linear_modules if is_quantized_linear(module)]
+
+    quantizers = [(name, module) for name, module in model.named_modules() if isinstance(module, TensorQuantizer)]
+    enabled_quantizers = [(name, module) for name, module in quantizers if _is_enabled_tensor_quantizer(module)]
+
+    print("\n  Quantized module coverage:")
+    print(f"    Linear modules: {len(linear_modules)}")
+    if is_quantized_linear is None:
+        print("    Quantized Linear modules: unavailable (is_quantized_linear import failed)")
+    else:
+        print(f"    Quantized Linear modules: {len(quantized_linear_names)}")
+        if linear_modules:
+            print(f"    Linear quantization coverage: {len(quantized_linear_names) / len(linear_modules) * 100:.1f}%")
+    print(f"    TensorQuantizer modules: {len(quantizers)}")
+    print(f"    Enabled TensorQuantizer modules: {len(enabled_quantizers)}")
+
+    unquantized_linears = [name for name, _ in linear_modules if name not in set(quantized_linear_names)]
+    if unquantized_linears:
+        print("    Unquantized Linear modules (first 30):")
+        for name in unquantized_linears[:30]:
+            print(f"      - {name}")
+
+
+def report_onnx_qdq_coverage(onnx_path: str) -> None:
+    """Report ONNX QDQ node coverage after export and post-processing."""
+    onnx_model = onnx.load(onnx_path, load_external_data=False)
+    node_types: dict[str, int] = {}
+    for node in onnx_model.graph.node:
+        node_types[node.op_type] = node_types.get(node.op_type, 0) + 1
+
+    quantize_count = node_types.get("QuantizeLinear", 0)
+    dequantize_count = node_types.get("DequantizeLinear", 0)
+    compute_count = sum(node_types.get(op_type, 0) for op_type in ("MatMul", "Gemm", "Conv"))
+
+    print("\n  ONNX QDQ coverage:")
+    print(f"    QuantizeLinear nodes: {quantize_count}")
+    print(f"    DequantizeLinear nodes: {dequantize_count}")
+    print(f"    MatMul/Gemm/Conv nodes: {compute_count}")
+    if compute_count:
+        print(f"    QDQ pairs per compute node: {min(quantize_count, dequantize_count) / compute_count:.2f}")
 
 
 def _create_observation_from_inputs(images, img_masks, state, lang_tokens, lang_masks):
@@ -479,7 +609,7 @@ def quantize_model(
     if quantize_attention_matmul:
         replace_attention_with_quantized_version()
 
-    quant_cfg = mtq.FP8_DEFAULT_CFG
+    quant_cfg = copy.deepcopy(mtq.FP8_DEFAULT_CFG)
     quant_cfg["quant_cfg"]["nn.Conv2d"] = {"*": {"enable": False}}
 
     if enable_llm_nvfp4:
@@ -499,6 +629,8 @@ def quantize_model(
             "axis": None,
             "enable": False,
         }
+
+    report_quant_cfg_coverage(model, quant_cfg)
 
     if calibration_data is not None:
         num_samples = len(calibration_data.dataset) if hasattr(calibration_data, "dataset") else "unknown"
@@ -528,6 +660,7 @@ def quantize_model(
 
     print("\n  Quantization Summary:")
     mtq.print_quant_summary(quantized_model)
+    report_quantized_module_coverage(quantized_model)
 
     print("  FP8 quantization completed")
 
@@ -709,6 +842,7 @@ def export_to_onnx(
             },
         )
         postprocess_onnx_model(onnx_path, enable_llm_nvfp4)
+        report_onnx_qdq_coverage(str(onnx_path))
 
     return model
 
