@@ -16,6 +16,10 @@ def torch_type(trt_type):
         trt.uint8: torch.uint8,
         trt.int64: torch.int64,
     }
+    if hasattr(trt, "bfloat16"):
+        mapping[trt.bfloat16] = torch.bfloat16
+    if hasattr(trt, "fp8") and hasattr(torch, "float8_e4m3fn"):
+        mapping[trt.fp8] = torch.float8_e4m3fn
     if trt_type in mapping:
         return mapping[trt_type]
 

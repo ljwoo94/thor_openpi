@@ -55,7 +55,13 @@ def pi0_tensorrt_sample_actions(self, device, observation, noise=None, num_steps
     # Get batch size from images
     batch_size = images.shape[0]
 
-    target_dtype = torch.float16
+    input_dtypes = {name: dtype for name, _, dtype in self.trt_engine.in_meta}
+    image_dtype = input_dtypes.get("images", torch.float32)
+    img_masks_dtype = input_dtypes.get("img_masks", torch.bool)
+    lang_tokens_dtype = input_dtypes.get("lang_tokens", torch.int64)
+    lang_masks_dtype = input_dtypes.get("lang_masks", torch.bool)
+    state_dtype = input_dtypes.get("state", torch.float32)
+    noise_dtype = input_dtypes.get("noise", torch.float32)
 
     # Handle noise input - generate if not provided
     if noise is None:
@@ -67,7 +73,7 @@ def pi0_tensorrt_sample_actions(self, device, observation, noise=None, num_steps
             mean=0.0,
             std=1.0,
             size=(batch_size, action_horizon, action_dim),
-            dtype=target_dtype,
+            dtype=noise_dtype,
             device=device,
         )
     else:
@@ -78,17 +84,23 @@ def pi0_tensorrt_sample_actions(self, device, observation, noise=None, num_steps
         if noise.dim() == 2:  # [action_horizon, action_dim]
             noise = noise.unsqueeze(0)  # [1, action_horizon, action_dim]
         # Ensure correct dtype and device
-        if noise.dtype != target_dtype:
-            noise = noise.to(target_dtype)
+        if noise.dtype != noise_dtype:
+            noise = noise.to(noise_dtype)
         if not noise.is_cuda:
             noise = noise.cuda()
         noise = noise.contiguous()
 
-    # Convert all tensors to the target dtype that matches the TensorRT engine
-    if images.dtype != target_dtype:
-        images = images.to(target_dtype)
-    if state.dtype != target_dtype:
-        state = state.to(target_dtype)
+    # Convert floating tensors to the dtype declared by the TensorRT engine.
+    if images.dtype != image_dtype:
+        images = images.to(image_dtype)
+    if img_masks.dtype != img_masks_dtype:
+        img_masks = img_masks.to(img_masks_dtype)
+    if lang_tokens.dtype != lang_tokens_dtype:
+        lang_tokens = lang_tokens.to(lang_tokens_dtype)
+    if lang_masks.dtype != lang_masks_dtype:
+        lang_masks = lang_masks.to(lang_masks_dtype)
+    if state.dtype != state_dtype:
+        state = state.to(state_dtype)
 
     # Ensure tensors are on CUDA
     images = images.cuda().contiguous()
@@ -107,7 +119,14 @@ def pi0_tensorrt_sample_actions(self, device, observation, noise=None, num_steps
 
     # Run TensorRT inference
     # The engine expects inputs in order: images, img_masks, lang_tokens, lang_masks, state, noise
-    outputs = self.trt_engine(images, img_masks, lang_tokens, lang_masks, state, noise)
+    outputs = self.trt_engine(
+        images=images,
+        img_masks=img_masks,
+        lang_tokens=lang_tokens,
+        lang_masks=lang_masks,
+        state=state,
+        noise=noise,
+    )
 
     # Extract actions from output dict
     actions = outputs["actions"]

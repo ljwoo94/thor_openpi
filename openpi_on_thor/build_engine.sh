@@ -57,7 +57,9 @@ mkdir -p "$(dirname "$ENGINE_PATH")"
 # --stronglyTyped preserves FP32 precision for numerically sensitive operations
 # (softmax, RMSNorm) and FP32 denoising loop accumulation.
 ONNX_BASENAME=$(basename "$ONNX_PATH" .onnx)
-if [[ "$ONNX_BASENAME" == *"fp8"* ]] || [[ "$ONNX_BASENAME" == *"nvfp4"* ]]; then
+if [ -n "${PRECISION_FLAGS:-}" ]; then
+    PRECISION_FLAGS="$PRECISION_FLAGS"
+elif [[ "$ONNX_BASENAME" == *"fp8"* ]] || [[ "$ONNX_BASENAME" == *"nvfp4"* ]]; then
     PRECISION_FLAGS="--fp16 --fp8 --stronglyTyped"
 else
     PRECISION_FLAGS="--fp16 --stronglyTyped"
@@ -105,4 +107,3 @@ echo "  lang_tokens: [${MIN_BATCH}x${MIN_SEQ_LEN}] to [${MAX_BATCH}x${MAX_SEQ_LE
 echo "  lang_masks: [${MIN_BATCH}x${MIN_SEQ_LEN}] to [${MAX_BATCH}x${MAX_SEQ_LEN}]"
 echo "  state: [${MIN_BATCH}x${STATE_DIM}] to [${MAX_BATCH}x${STATE_DIM}]"
 echo "  noise: [${MIN_BATCH}x${ACTION_HORIZON}x${ACTION_DIM}] to [${MAX_BATCH}x${ACTION_HORIZON}x${ACTION_DIM}]"
-
