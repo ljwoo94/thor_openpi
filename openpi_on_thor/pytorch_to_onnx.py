@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+import copy
+import fnmatch
 import os
 import sys
 from pathlib import Path
@@ -16,13 +18,18 @@ from openpi.policies import policy_config
 from openpi.models.model import IMAGE_KEYS, IMAGE_RESOLUTION
 from openpi.models.gemma import PALIGEMMA_VOCAB_SIZE
 
-import modelopt.torch.quantization as mtq
 from openpi_on_thor.calibration_data import load_calibration_data
 
-from modelopt.torch.quantization.nn import TensorQuantizer
-from modelopt.torch.quantization.config import QuantizerAttributeConfig
-
 # ---------------------------------------------------------------------------
+
+
+def _lazy_import_modelopt():
+    """Import ModelOpt only when quantization is requested."""
+    import modelopt.torch.quantization as mtq
+    from modelopt.torch.quantization.config import QuantizerAttributeConfig
+    from modelopt.torch.quantization.nn import TensorQuantizer
+
+    return mtq, TensorQuantizer, QuantizerAttributeConfig
 # Patch load_pytorch to handle dtype mismatches and tied weights across
 # different safetensors / transformers versions (e.g. 25.09 vs 26.01 containers).
 # ---------------------------------------------------------------------------
@@ -58,6 +65,7 @@ class QuantizedMatMul(torch.nn.Module):
 
     def _create_quantizers(self):
         if not self._quantizers_created:
+            _, TensorQuantizer, QuantizerAttributeConfig = _lazy_import_modelopt()
             self.input1_quantizer = TensorQuantizer(QuantizerAttributeConfig(num_bits=(4, 3)))
             self.input2_quantizer = TensorQuantizer(QuantizerAttributeConfig(num_bits=(4, 3)))
             self.input1_quantizer.enable_calib()
@@ -77,6 +85,170 @@ class QuantizedMatMul(torch.nn.Module):
 
         output = torch.matmul(input1, input2)
         return output
+
+
+def _torch_dtype_from_name(dtype_name: str) -> torch.dtype:
+    normalized = dtype_name.lower()
+    if normalized in {"fp32", "float32"}:
+        return torch.float32
+    if normalized in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if normalized in {"fp16", "float16", "half"}:
+        return torch.float16
+    raise ValueError(f"Unsupported dtype: {dtype_name}")
+
+
+def _module_name_matches(name: str, patterns: tuple[str, ...]) -> bool:
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+
+
+EXPERT_PROJECTION_PATTERNS = (
+    "paligemma_with_expert.gemma_expert.model.layers.*.self_attn.q_proj",
+    "paligemma_with_expert.gemma_expert.model.layers.*.self_attn.k_proj",
+    "paligemma_with_expert.gemma_expert.model.layers.*.self_attn.v_proj",
+    "paligemma_with_expert.gemma_expert.model.layers.*.self_attn.o_proj",
+    "paligemma_with_expert.gemma_expert.model.layers.*.mlp.gate_proj",
+    "paligemma_with_expert.gemma_expert.model.layers.*.mlp.up_proj",
+    "paligemma_with_expert.gemma_expert.model.layers.*.mlp.down_proj",
+)
+
+LANGUAGE_PROJECTION_PATTERNS = (
+    "paligemma_with_expert.paligemma.model.language_model.layers.*.self_attn.q_proj",
+    "paligemma_with_expert.paligemma.model.language_model.layers.*.self_attn.k_proj",
+    "paligemma_with_expert.paligemma.model.language_model.layers.*.self_attn.v_proj",
+    "paligemma_with_expert.paligemma.model.language_model.layers.*.self_attn.o_proj",
+    "paligemma_with_expert.paligemma.model.language_model.layers.*.mlp.gate_proj",
+    "paligemma_with_expert.paligemma.model.language_model.layers.*.mlp.up_proj",
+    "paligemma_with_expert.paligemma.model.language_model.layers.*.mlp.down_proj",
+    "paligemma_with_expert.paligemma.language_model.layers.*.self_attn.q_proj",
+    "paligemma_with_expert.paligemma.language_model.layers.*.self_attn.k_proj",
+    "paligemma_with_expert.paligemma.language_model.layers.*.self_attn.v_proj",
+    "paligemma_with_expert.paligemma.language_model.layers.*.self_attn.o_proj",
+    "paligemma_with_expert.paligemma.language_model.layers.*.mlp.gate_proj",
+    "paligemma_with_expert.paligemma.language_model.layers.*.mlp.up_proj",
+    "paligemma_with_expert.paligemma.language_model.layers.*.mlp.down_proj",
+)
+
+SIGLIP_ENCODER_PROJECTION_PATTERNS = (
+    "paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.*.self_attn.q_proj",
+    "paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.*.self_attn.k_proj",
+    "paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.*.self_attn.v_proj",
+    "paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.*.self_attn.out_proj",
+    "paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.*.mlp.fc1",
+    "paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.*.mlp.fc2",
+    "paligemma_with_expert.paligemma.vision_tower.vision_model.encoder.layers.*.self_attn.q_proj",
+    "paligemma_with_expert.paligemma.vision_tower.vision_model.encoder.layers.*.self_attn.k_proj",
+    "paligemma_with_expert.paligemma.vision_tower.vision_model.encoder.layers.*.self_attn.v_proj",
+    "paligemma_with_expert.paligemma.vision_tower.vision_model.encoder.layers.*.self_attn.out_proj",
+    "paligemma_with_expert.paligemma.vision_tower.vision_model.encoder.layers.*.mlp.fc1",
+    "paligemma_with_expert.paligemma.vision_tower.vision_model.encoder.layers.*.mlp.fc2",
+)
+
+MULTIMODAL_PROJECTOR_PATTERNS = (
+    "paligemma_with_expert.paligemma.model.multi_modal_projector*",
+    "paligemma_with_expert.paligemma.multi_modal_projector*",
+)
+
+FP32_SENSITIVE_QUANT_PATTERNS = (
+    "paligemma_with_expert.paligemma.model.vision_tower.vision_model.embeddings.*",
+    "paligemma_with_expert.paligemma.model.vision_tower.vision_model.*layernorm*",
+    "paligemma_with_expert.paligemma.model.vision_tower.vision_model.encoder.layers.*.layer_norm*",
+    "paligemma_with_expert.paligemma.model.multi_modal_projector*",
+    "paligemma_with_expert.paligemma.vision_tower.vision_model.embeddings.*",
+    "paligemma_with_expert.paligemma.vision_tower.vision_model.*layernorm*",
+    "paligemma_with_expert.paligemma.vision_tower.vision_model.encoder.layers.*.layer_norm*",
+    "paligemma_with_expert.paligemma.multi_modal_projector*",
+    "paligemma_with_expert.*input_layernorm*",
+    "paligemma_with_expert.*post_attention_layernorm*",
+    "paligemma_with_expert.*model.norm*",
+    "action_out_proj",
+)
+
+EXPERT_QUANT_PATTERNS = EXPERT_PROJECTION_PATTERNS
+LANGUAGE_QUANT_PATTERNS = LANGUAGE_PROJECTION_PATTERNS
+SIGLIP_ENCODER_QUANT_PATTERNS = SIGLIP_ENCODER_PROJECTION_PATTERNS
+
+
+def cast_matching_modules(model: torch.nn.Module, patterns: tuple[str, ...], dtype: torch.dtype) -> list[str]:
+    """Cast selected modules by fully-qualified module name."""
+    matched: list[str] = []
+    for name, module in model.named_modules():
+        if _module_name_matches(name, patterns):
+            module.to(dtype=dtype)
+            matched.append(name)
+    return matched
+
+
+def _add_quant_cfg_entry(quant_cfg: dict, quantizer_name: str, cfg: dict) -> None:
+    """Add a ModelOpt quantizer config entry for both list and dict config styles."""
+    entries = quant_cfg["quant_cfg"]
+    if isinstance(entries, list):
+        entries.append({"quantizer_name": quantizer_name, **cfg})
+    else:
+        entries[quantizer_name] = cfg
+
+
+def _build_fp8_quant_cfg(
+    mtq,
+    *,
+    enable_llm_nvfp4: bool = False,
+    fp8_all_supported_linears: bool = False,
+    fp8_expert_linears: bool = False,
+    fp8_language_linears: bool = False,
+    fp8_siglip_encoder_linears: bool = False,
+) -> dict:
+    """Build a conservative ModelOpt FP8 config.
+
+    The scoped mode starts from a deny-all default and enables selected linear
+    quantizers. The legacy all-supported mode preserves previous behavior with
+    additional explicit safety disables.
+    """
+    quant_cfg = copy.deepcopy(mtq.FP8_DEFAULT_CFG)
+    _add_quant_cfg_entry(quant_cfg, "*nn.Conv2d*", {"enable": False})
+    _add_quant_cfg_entry(quant_cfg, "nn.Conv2d", {"*": {"enable": False}})
+
+    for pattern in FP32_SENSITIVE_QUANT_PATTERNS:
+        _add_quant_cfg_entry(quant_cfg, f"{pattern}*", {"enable": False})
+
+    if not fp8_all_supported_linears:
+        _add_quant_cfg_entry(quant_cfg, "*", {"enable": False})
+        scoped_patterns: list[str] = []
+        if fp8_expert_linears:
+            scoped_patterns.extend(EXPERT_QUANT_PATTERNS)
+        if fp8_language_linears:
+            scoped_patterns.extend(LANGUAGE_QUANT_PATTERNS)
+        if fp8_siglip_encoder_linears:
+            scoped_patterns.extend(SIGLIP_ENCODER_QUANT_PATTERNS)
+
+        for pattern in scoped_patterns:
+            _add_quant_cfg_entry(quant_cfg, f"{pattern}*input_quantizer", {"enable": True})
+            _add_quant_cfg_entry(quant_cfg, f"{pattern}*weight_quantizer", {"enable": True})
+
+    if enable_llm_nvfp4:
+        print("  Enabling NVFP4 quantization for LLM layers...")
+        _add_quant_cfg_entry(
+            quant_cfg,
+            "paligemma_with_expert.paligemma.model.language_model.layers.*",
+            {
+                "num_bits": (2, 1),
+                "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+                "axis": None,
+                "enable": True,
+            },
+        )
+
+        _add_quant_cfg_entry(
+            quant_cfg,
+            "paligemma_with_expert.paligemma.model.language_model.layers.*.output_quantizer",
+            {
+                "num_bits": (2, 1),
+                "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+                "axis": None,
+                "enable": False,
+            },
+        )
+
+    return quant_cfg
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -122,6 +294,34 @@ def quantized_eager_attention_forward(
     return attn_output, attn_weights
 
 
+def quantized_siglip_attention_forward(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor,
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs,
+):
+    """SigLIP attention forward with QDQ on QK and AV matmuls only."""
+    if not hasattr(module, "qk_matmul"):
+        module.add_module("qk_matmul", QuantizedMatMul())
+    if not hasattr(module, "av_matmul"):
+        module.add_module("av_matmul", QuantizedMatMul())
+
+    attn_weights = module.qk_matmul(query, key.transpose(-1, -2)) * scaling
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+
+    attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = torch.nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output = module.av_matmul(attn_weights, value)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    return attn_output, attn_weights
+
+
 def replace_attention_with_quantized_version():
     """Replace eager_attention_forward with quantized version."""
     from transformers.models.gemma import modeling_gemma
@@ -130,6 +330,16 @@ def replace_attention_with_quantized_version():
         modeling_gemma._original_eager_attention_forward = modeling_gemma.eager_attention_forward
 
     modeling_gemma.eager_attention_forward = quantized_eager_attention_forward
+
+
+def replace_siglip_attention_with_quantized_version():
+    """Replace SigLIP eager_attention_forward with quantized version."""
+    from transformers.models.siglip import modeling_siglip
+
+    if not hasattr(modeling_siglip, "_original_eager_attention_forward"):
+        modeling_siglip._original_eager_attention_forward = modeling_siglip.eager_attention_forward
+
+    modeling_siglip.eager_attention_forward = quantized_siglip_attention_forward
 
 
 def _create_observation_from_inputs(images, img_masks, state, lang_tokens, lang_masks):
@@ -234,7 +444,7 @@ class ONNXWrapper(torch.nn.Module):
 
 
 def _create_dummy_inputs(
-    model_device: torch.device, model_config, compute_dtype: torch.dtype = torch.float16
+    model_device: torch.device, model_config, compute_dtype: torch.dtype = torch.float32
 ) -> Tuple:
     """Create dummy inputs for ONNX export.
 
@@ -243,7 +453,7 @@ def _create_dummy_inputs(
     Args:
         model_device: Device to create tensors on
         model_config: Model configuration
-        compute_dtype: Compute dtype for input tensors (default: torch.float16)
+        compute_dtype: Compute dtype for input tensors (default: torch.float32)
 
     Returns:
         Tuple of dummy input tensors
@@ -282,13 +492,13 @@ def _create_dummy_inputs(
     return dummy_inputs
 
 
-def patch_model_for_export(model, compute_dtype=torch.float16):
+def patch_model_for_export(model, compute_dtype=torch.float32):
     """
     Patch model to add compute_dtype support without modifying original code.
 
     Args:
         model: PI0Pytorch model instance
-        compute_dtype: Compute dtype, default torch.float16
+        compute_dtype: Compute dtype, default torch.float32
 
     Returns:
         Patched model
@@ -459,7 +669,12 @@ def quantize_model(
     calibration_data=None,
     num_steps: int = 10,
     enable_llm_nvfp4: bool = False,
-    quantize_attention_matmul: bool = True,
+    quantize_attention_matmul: bool = False,
+    quantize_siglip_attention_matmul: bool = False,
+    fp8_all_supported_linears: bool = False,
+    fp8_expert_linears: bool = False,
+    fp8_language_linears: bool = False,
+    fp8_siglip_encoder_linears: bool = False,
 ) -> torch.nn.Module:
     """Quantize model using NVIDIA modelopt (FP8 with optional NVFP4 for LLM layers).
 
@@ -469,36 +684,28 @@ def quantize_model(
         calibration_data: DataLoader with calibration data (preferred), or None
         num_steps: Number of denoising steps for the model
         enable_llm_nvfp4: Enable NVFP4 quantization for LLM layers (default: False)
-        quantize_attention_matmul: Enable QDQ nodes for attention matmul operations (default: True)
+        quantize_attention_matmul: Enable QDQ nodes for Gemma attention matmul operations (default: False)
+        quantize_siglip_attention_matmul: Enable QDQ nodes for SigLIP attention matmul operations (default: False)
 
     Returns:
         Quantized model (FP8 base, with optional NVFP4 LLM layers)
     """
     print("  Quantizing model to FP8 using NVIDIA modelopt...")
+    mtq, _, _ = _lazy_import_modelopt()
 
     if quantize_attention_matmul:
         replace_attention_with_quantized_version()
+    if quantize_siglip_attention_matmul:
+        replace_siglip_attention_with_quantized_version()
 
-    quant_cfg = mtq.FP8_DEFAULT_CFG
-    quant_cfg["quant_cfg"]["nn.Conv2d"] = {"*": {"enable": False}}
-
-    if enable_llm_nvfp4:
-        print("  Enabling NVFP4 quantization for LLM layers...")
-        quant_cfg["quant_cfg"]["paligemma_with_expert.paligemma.model.language_model.layers.*"] = {
-            "num_bits": (2, 1),
-            "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
-            "axis": None,
-            "enable": True,
-        }
-
-        quant_cfg["quant_cfg"][
-            "paligemma_with_expert.paligemma.model.language_model.layers.*.output_quantizer"
-        ] = {
-            "num_bits": (2, 1),
-            "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
-            "axis": None,
-            "enable": False,
-        }
+    quant_cfg = _build_fp8_quant_cfg(
+        mtq,
+        enable_llm_nvfp4=enable_llm_nvfp4,
+        fp8_all_supported_linears=fp8_all_supported_linears,
+        fp8_expert_linears=fp8_expert_linears,
+        fp8_language_linears=fp8_language_linears,
+        fp8_siglip_encoder_linears=fp8_siglip_encoder_linears,
+    )
 
     if calibration_data is not None:
         num_samples = len(calibration_data.dataset) if hasattr(calibration_data, "dataset") else "unknown"
@@ -547,37 +754,71 @@ def quantize_model(
 
 def _prepare_model_for_export(
     model: torch.nn.Module,
-    precision: str = "fp8",
+    precision: str = "fp32",
     dummy_inputs: Tuple = None,
     config_obj=None,
     checkpoint_dir: str = None,
     num_calibration_samples: int = 32,
     num_steps: int = 10,
     enable_llm_nvfp4: bool = False,
-    quantize_attention_matmul: bool = True,
+    quantize_attention_matmul: bool = False,
+    quantize_siglip_attention_matmul: bool = False,
+    compute_dtype: torch.dtype = torch.float32,
+    bf16_expert_projections: bool = False,
+    bf16_language_projections: bool = False,
+    bf16_siglip_encoder_projections: bool = False,
+    bf16_multimodal_projector: bool = False,
+    fp8_all_supported_linears: bool = False,
+    fp8_expert_linears: bool = False,
+    fp8_language_linears: bool = False,
+    fp8_siglip_encoder_linears: bool = False,
 ) -> torch.nn.Module:
     """Prepare model for ONNX export by converting to specified precision and eval mode.
 
     Args:
         model: PyTorch model to prepare
-        precision: Model precision ("fp8")
+        precision: Model precision ("fp32" or "fp8")
         dummy_inputs: Dummy inputs for FP8 calibration (required for fp8)
         config_obj: Training config object (for loading calibration data)
         checkpoint_dir: Path to model checkpoint directory (for loading calibration policy)
         num_calibration_samples: Number of calibration samples to use for FP8
         num_steps: Number of denoising steps
         enable_llm_nvfp4: Enable NVFP4 quantization for LLM layers (default: False)
-        quantize_attention_matmul: Enable QDQ nodes for attention matmul operations (default: True)
+        quantize_attention_matmul: Enable QDQ nodes for Gemma attention matmul operations
+        quantize_siglip_attention_matmul: Enable QDQ nodes for SigLIP attention matmul operations
 
     Returns:
         Prepared model
     """
     model.eval()
 
-    model = patch_model_for_export(model, compute_dtype=torch.float16)
-    model = model.to(torch.float16)
+    model = patch_model_for_export(model, compute_dtype=compute_dtype)
+    model = model.to(torch.float32)
 
-    if precision.lower() == "fp8":
+    bf16_patterns: list[str] = []
+    if bf16_expert_projections:
+        bf16_patterns.extend(EXPERT_PROJECTION_PATTERNS)
+    if bf16_language_projections:
+        bf16_patterns.extend(LANGUAGE_PROJECTION_PATTERNS)
+    if bf16_siglip_encoder_projections:
+        bf16_patterns.extend(SIGLIP_ENCODER_PROJECTION_PATTERNS)
+    if bf16_multimodal_projector:
+        bf16_patterns.extend(MULTIMODAL_PROJECTOR_PATTERNS)
+
+    if bf16_patterns:
+        matched = cast_matching_modules(model, tuple(bf16_patterns), torch.bfloat16)
+        print(f"  Cast {len(matched)} selected projection modules to bfloat16")
+        for name in matched[:20]:
+            print(f"    bf16: {name}")
+        if len(matched) > 20:
+            print(f"    ... {len(matched) - 20} more")
+
+    precision_normalized = precision.lower()
+    if precision_normalized == "fp32":
+        dtype_str = "float32"
+        if bf16_patterns:
+            dtype_str += " with scoped bfloat16 projections"
+    elif precision_normalized == "fp8":
         if dummy_inputs is None:
             raise ValueError("dummy_inputs required for FP8 quantization")
 
@@ -589,20 +830,27 @@ def _prepare_model_for_export(
                 checkpoint_dir,
                 num_calibration_samples,
                 str(device),
-                compute_dtype=torch.float16,
+                compute_dtype=compute_dtype,
             )
 
         model = quantize_model(
-            model, dummy_inputs, calibration_data, num_steps, enable_llm_nvfp4, quantize_attention_matmul
+            model,
+            dummy_inputs,
+            calibration_data,
+            num_steps,
+            enable_llm_nvfp4,
+            quantize_attention_matmul,
+            quantize_siglip_attention_matmul,
+            fp8_all_supported_linears,
+            fp8_expert_linears,
+            fp8_language_linears,
+            fp8_siglip_encoder_linears,
         )
-        dtype_str = "float8 (quantized from float16)"
+        dtype_str = "float8 QDQ (quantized from float32 export baseline)"
         if enable_llm_nvfp4:
             dtype_str += " with NVFP4 LLM"
     else:
-        raise ValueError(
-            "Only FP8 precision is supported. The Pi0.5 model uses BF16 natively and "
-            "FP16 has insufficient dynamic range. Use: --precision fp8 --enable_llm_nvfp4 --quantize_attention_matmul"
-        )
+        raise ValueError("Only fp32 and fp8 precision exports are supported")
 
     device = next(model.parameters()).device
     print(f"  Model device: {device}, dtype: {dtype_str}")
@@ -618,12 +866,22 @@ def export_to_onnx(
     output_path: Path,
     model_config,
     num_steps: int = 10,
-    precision: str = "fp8",
+    precision: str = "fp32",
     config_obj=None,
     checkpoint_dir: str = None,
     num_calibration_samples: int = 32,
     enable_llm_nvfp4: bool = False,
-    quantize_attention_matmul: bool = True,
+    quantize_attention_matmul: bool = False,
+    quantize_siglip_attention_matmul: bool = False,
+    compute_dtype: torch.dtype = torch.float32,
+    bf16_expert_projections: bool = False,
+    bf16_language_projections: bool = False,
+    bf16_siglip_encoder_projections: bool = False,
+    bf16_multimodal_projector: bool = False,
+    fp8_all_supported_linears: bool = False,
+    fp8_expert_linears: bool = False,
+    fp8_language_linears: bool = False,
+    fp8_siglip_encoder_linears: bool = False,
 ) -> torch.nn.Module:
     """
     Export PyTorch model to ONNX format.
@@ -633,12 +891,13 @@ def export_to_onnx(
         output_path: Output directory path
         model_config: Model configuration (Pi0Config)
         num_steps: Number of denoising steps (default: 10)
-        precision: Model precision ("fp8")
+        precision: Model precision ("fp32" or "fp8")
         config_obj: Training config object (for FP8 calibration with real data)
         checkpoint_dir: Path to model checkpoint directory (for loading calibration policy)
         num_calibration_samples: Number of calibration samples for FP8 (default: 32)
         enable_llm_nvfp4: Enable NVFP4 quantization for LLM layers (default: False)
-        quantize_attention_matmul: Enable QDQ nodes for attention matmul operations (default: True)
+        quantize_attention_matmul: Enable QDQ nodes for Gemma attention matmul operations
+        quantize_siglip_attention_matmul: Enable QDQ nodes for SigLIP attention matmul operations
 
     Returns:
         Exported model
@@ -649,7 +908,7 @@ def export_to_onnx(
         print(f"Exporting model to ONNX format with precision: {precision.upper()}...")
 
     device = next(model.parameters()).device
-    dummy_inputs = _create_dummy_inputs(device, model_config, torch.float16)
+    dummy_inputs = _create_dummy_inputs(device, model_config, compute_dtype)
 
     model = _prepare_model_for_export(
         model,
@@ -661,6 +920,16 @@ def export_to_onnx(
         num_steps,
         enable_llm_nvfp4,
         quantize_attention_matmul,
+        quantize_siglip_attention_matmul,
+        compute_dtype,
+        bf16_expert_projections,
+        bf16_language_projections,
+        bf16_siglip_encoder_projections,
+        bf16_multimodal_projector,
+        fp8_all_supported_linears,
+        fp8_expert_linears,
+        fp8_language_linears,
+        fp8_siglip_encoder_linears,
     )
     device = next(model.parameters()).device
 
@@ -672,10 +941,31 @@ def export_to_onnx(
     onnx_dir = output_dir / "onnx"
     onnx_dir.mkdir(parents=True, exist_ok=True)
 
-    if enable_llm_nvfp4 and precision.lower() == "fp8":
-        onnx_filename = f"model_{precision.lower()}_nvfp4.onnx"
-    else:
-        onnx_filename = f"model_{precision.lower()}.onnx"
+    filename_parts = [f"model_{precision.lower()}"]
+    if bf16_expert_projections:
+        filename_parts.append("bf16expert")
+    if bf16_language_projections:
+        filename_parts.append("bf16lang")
+    if bf16_siglip_encoder_projections:
+        filename_parts.append("bf16siglip")
+    if bf16_multimodal_projector:
+        filename_parts.append("bf16mmproj")
+    if precision.lower() == "fp8":
+        if fp8_all_supported_linears:
+            filename_parts.append("fp8all")
+        if fp8_expert_linears:
+            filename_parts.append("fp8expert")
+        if fp8_language_linears:
+            filename_parts.append("fp8lang")
+        if fp8_siglip_encoder_linears:
+            filename_parts.append("fp8siglip")
+        if quantize_attention_matmul:
+            filename_parts.append("fp8attn")
+        if quantize_siglip_attention_matmul:
+            filename_parts.append("fp8siglipattn")
+        if enable_llm_nvfp4:
+            filename_parts.append("nvfp4")
+    onnx_filename = "_".join(filename_parts) + ".onnx"
 
     onnx_path = onnx_dir / onnx_filename
 
@@ -718,10 +1008,20 @@ def export_checkpoint_to_onnx(
     output_path: Path,
     config_name: str = "pi05_droid",
     num_steps: int = 10,
-    precision: str = "fp8",
+    precision: str = "fp32",
     num_calibration_samples: int = 32,
     enable_llm_nvfp4: bool = False,
-    quantize_attention_matmul: bool = True,
+    quantize_attention_matmul: bool = False,
+    quantize_siglip_attention_matmul: bool = False,
+    compute_dtype: torch.dtype = torch.float32,
+    bf16_expert_projections: bool = False,
+    bf16_language_projections: bool = False,
+    bf16_siglip_encoder_projections: bool = False,
+    bf16_multimodal_projector: bool = False,
+    fp8_all_supported_linears: bool = False,
+    fp8_expert_linears: bool = False,
+    fp8_language_linears: bool = False,
+    fp8_siglip_encoder_linears: bool = False,
 ) -> torch.nn.Module:
     """
     Export a trained model checkpoint to ONNX format.
@@ -731,10 +1031,11 @@ def export_checkpoint_to_onnx(
         output_path: ONNX output directory path
         config_name: Model configuration name
         num_steps: Number of denoising steps
-        precision: Model precision ("fp8")
+        precision: Model precision ("fp32" or "fp8")
         num_calibration_samples: Number of samples to use for FP8 calibration (default: 32)
         enable_llm_nvfp4: Enable NVFP4 quantization for LLM layers (default: False)
-        quantize_attention_matmul: Enable QDQ nodes for attention matmul operations (default: True)
+        quantize_attention_matmul: Enable QDQ nodes for Gemma attention matmul operations
+        quantize_siglip_attention_matmul: Enable QDQ nodes for SigLIP attention matmul operations
 
     Returns:
         Exported model
@@ -759,6 +1060,16 @@ def export_checkpoint_to_onnx(
         num_calibration_samples=num_calibration_samples,
         enable_llm_nvfp4=enable_llm_nvfp4,
         quantize_attention_matmul=quantize_attention_matmul,
+        quantize_siglip_attention_matmul=quantize_siglip_attention_matmul,
+        compute_dtype=compute_dtype,
+        bf16_expert_projections=bf16_expert_projections,
+        bf16_language_projections=bf16_language_projections,
+        bf16_siglip_encoder_projections=bf16_siglip_encoder_projections,
+        bf16_multimodal_projector=bf16_multimodal_projector,
+        fp8_all_supported_linears=fp8_all_supported_linears,
+        fp8_expert_linears=fp8_expert_linears,
+        fp8_language_linears=fp8_language_linears,
+        fp8_siglip_encoder_linears=fp8_siglip_encoder_linears,
     )
 
     print(f"  ONNX model saved to: {output_path}/onnx/")
@@ -791,9 +1102,16 @@ def main():
     parser.add_argument(
         "--precision",
         type=str,
-        default="fp8",
-        choices=["fp8", "FP8"],
-        help="Model precision type (default: fp8). FP16 is not supported — the model uses BF16 natively.",
+        default="fp32",
+        choices=["fp32", "FP32", "fp8", "FP8"],
+        help="Model precision type (default: fp32). Use fp8 to add scoped QDQ quantization.",
+    )
+    parser.add_argument(
+        "--compute_dtype",
+        type=str,
+        default="fp32",
+        choices=["fp32", "float32", "bf16", "bfloat16", "fp16", "float16"],
+        help="Tensor dtype used for dummy inputs and export-time denoising compute (default: fp32)",
     )
     parser.add_argument(
         "--num_calibration_samples",
@@ -809,7 +1127,52 @@ def main():
     parser.add_argument(
         "--quantize_attention_matmul",
         action="store_true",
-        help="Enable QDQ nodes for attention matmul operations (only applies with --precision fp8)",
+        help="Enable QDQ nodes for Gemma attention matmul operations (only applies with --precision fp8)",
+    )
+    parser.add_argument(
+        "--quantize_siglip_attention_matmul",
+        action="store_true",
+        help="Enable QDQ nodes for SigLIP attention matmul operations (only applies with --precision fp8)",
+    )
+    parser.add_argument(
+        "--bf16_expert_projections",
+        action="store_true",
+        help="Cast Gemma expert attention and MLP projection modules to BF16 before export",
+    )
+    parser.add_argument(
+        "--bf16_language_projections",
+        action="store_true",
+        help="Cast PaliGemma language attention and MLP projection modules to BF16 before export",
+    )
+    parser.add_argument(
+        "--bf16_siglip_encoder_projections",
+        action="store_true",
+        help="Cast SigLIP vision encoder attention and MLP projection modules to BF16 before export",
+    )
+    parser.add_argument(
+        "--bf16_multimodal_projector",
+        action="store_true",
+        help="Cast the PaliGemma multimodal projector to BF16 before export",
+    )
+    parser.add_argument(
+        "--fp8_all_supported_linears",
+        action="store_true",
+        help="Use legacy broad ModelOpt FP8 quantization for all supported modules except explicit safety exclusions",
+    )
+    parser.add_argument(
+        "--fp8_expert_linears",
+        action="store_true",
+        help="Enable FP8 QDQ for Gemma expert attention and MLP projection modules",
+    )
+    parser.add_argument(
+        "--fp8_language_linears",
+        action="store_true",
+        help="Enable FP8 QDQ for PaliGemma language attention and MLP projection modules",
+    )
+    parser.add_argument(
+        "--fp8_siglip_encoder_linears",
+        action="store_true",
+        help="Enable FP8 QDQ for SigLIP vision encoder attention and MLP projection modules",
     )
 
     args = parser.parse_args()
@@ -824,6 +1187,16 @@ def main():
             num_calibration_samples=args.num_calibration_samples,
             enable_llm_nvfp4=args.enable_llm_nvfp4,
             quantize_attention_matmul=args.quantize_attention_matmul,
+            quantize_siglip_attention_matmul=args.quantize_siglip_attention_matmul,
+            compute_dtype=_torch_dtype_from_name(args.compute_dtype),
+            bf16_expert_projections=args.bf16_expert_projections,
+            bf16_language_projections=args.bf16_language_projections,
+            bf16_siglip_encoder_projections=args.bf16_siglip_encoder_projections,
+            bf16_multimodal_projector=args.bf16_multimodal_projector,
+            fp8_all_supported_linears=args.fp8_all_supported_linears,
+            fp8_expert_linears=args.fp8_expert_linears,
+            fp8_language_linears=args.fp8_language_linears,
+            fp8_siglip_encoder_linears=args.fp8_siglip_encoder_linears,
         )
     except Exception as e:
         print(f"Export failed: {e}")
