@@ -5,6 +5,7 @@ from typing import Any
 
 import jax.numpy as jnp
 
+import openpi.policies.flashrt_policy as _flashrt_policy
 import openpi.models.model as _model
 import openpi.policies.policy as _policy
 import openpi.shared.download as download
@@ -91,4 +92,47 @@ def create_trained_policy(
         metadata=train_config.policy_metadata,
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
+    )
+
+
+def create_flashrt_policy(
+    train_config: _config.TrainConfig,
+    checkpoint_dir: pathlib.Path | str,
+    *,
+    default_prompt: str | None = None,
+    num_views: int = 2,
+    autotune: int = 3,
+    hardware: str = "thor",
+    framework: str = "torch",
+    use_fp8: bool = True,
+    use_fp4: bool = False,
+    recalibrate: bool = False,
+) -> _flashrt_policy.FlashRTPolicy:
+    """Create a FlashRT-backed policy with the same robot-facing infer API.
+
+    This is intentionally separate from create_trained_policy so the baseline
+    OpenPI/JAX/PyTorch path remains unchanged while FlashRT is validated.
+    """
+    checkpoint_dir = download.maybe_download(str(checkpoint_dir))
+    if train_config.name != "pi05_libero":
+        raise ValueError(f"FlashRT policy currently supports only pi05_libero, got {train_config.name!r}.")
+    if train_config.model.action_horizon != 10:
+        raise ValueError("FlashRT pi05 LIBERO policy expects action_horizon=10.")
+    if train_config.model.action_dim != 32:
+        raise ValueError("FlashRT pi05 LIBERO policy expects action_dim=32.")
+    if getattr(train_config.model, "discrete_state_input", None):
+        raise ValueError("FlashRT pi05 LIBERO adapter expects discrete_state_input=False.")
+
+    return _flashrt_policy.FlashRTPolicy(
+        checkpoint_dir,
+        default_prompt=default_prompt,
+        num_views=num_views,
+        autotune=autotune,
+        hardware=hardware,
+        framework=framework,
+        config="pi05",
+        use_fp8=use_fp8,
+        use_fp4=use_fp4,
+        recalibrate=recalibrate,
+        metadata=train_config.policy_metadata,
     )
